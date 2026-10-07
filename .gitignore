@@ -1,0 +1,28 @@
+# Local credentials and environment settings
+.env
+.env.*
+.env_*
+!.env.example
+!.env.*.example
+!.env_*.example
+
+# Python environments, caches, and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Generated knowledge graph and local dbzero stores
+.graphify-index/
+graphify-out/
+.dbzero-data/
+dbzero-data/
