@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+import argparse, json, sys
+from decimal import Decimal
+from trader_api import TraderService, TraderError
+
+def main():
+    # The documented CLI permits --json either before or after the command.
+    argv = sys.argv[1:]
+    json_requested = "--json" in argv
+    argv = [x for x in argv if x != "--json"]
+    if "trade" in argv:
+        argv.remove("trade")
+    p = argparse.ArgumentParser(prog="trader")
+    p.add_argument("--env", choices=("demo", "real"), default="demo")
+    p.add_argument("--trader", required=True)
+    p.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="command", required=True)
+    i = sub.add_parser("init"); i.add_argument("--balance", required=True); i.add_argument("--currency", default="USD")
+    sub.add_parser("capabilities"); sub.add_parser("status"); sub.add_parser("positions"); sub.add_parser("orders")
+    a = sub.add_parser("preview-open"); a.add_argument("--symbol", required=True); a.add_argument("--side", required=True); a.add_argument("--notional", required=True); a.add_argument("--leverage", type=int, default=1)
+    s = sub.add_parser("submit"); s.add_argument("--preview-id", required=True); s.add_argument("--idempotency-key", required=True)
+    args = p.parse_args(argv)
+    try:
+        svc = TraderService(args.trader, args.env)
+        if args.command == "init": out = svc.initialize(args.balance, args.currency)
+        elif args.command == "capabilities": out = svc.capabilities()
+        elif args.command == "status": out = svc.trader_status()
+        elif args.command == "positions": out = svc.positions()
+        elif args.command == "orders": out = svc.orders()
+        elif args.command == "preview-open": out = svc.preview_open(symbol=args.symbol, side=args.side, notional=Decimal(args.notional), leverage=args.leverage)
+        else: out = svc.submit(args.preview_id, args.idempotency_key)
+        print(json.dumps({"schema_version":1,"environment":args.env,"trader_id":args.trader,"status":"ok","data":out,"error":None}, default=str))
+    except TraderError as e:
+        print(json.dumps({"schema_version":1,"environment":args.env,"trader_id":args.trader,"status":"error","data":None,"error":{"code":e.code,"message":e.message,"retryable":e.retryable,"details":{}}}))
+        return 1
+    return 0
+if __name__ == "__main__": sys.exit(main())
