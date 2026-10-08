@@ -9,27 +9,38 @@ from typing import Protocol
 
 from .auth import DEMO_READ, DEMO_WRITE, REAL_READ, REAL_WRITE, fingerprint
 from .config import fixed_storage_root
-from .domain import Environment, Lifecycle, ScopeEvidence, money, utc_now
+from .domain import Environment, ScopeEvidence, money, utc_now
 from .errors import TraderError
 from .secrets import CredentialVault
 from .storage import (
     DbzeroStore,
+    LedgerDomain,
     LedgerEntry,
+    LedgerKind,
+    Lifecycle,
     ProvisioningIntent,
+    ProvisioningState,
     TraderRegistration,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class ProvisionedPortfolio:
+    # Supplied owner identity; eToro adapter uses credential:<fingerprint>, not an account ID.
     owner_account_id: str
+    # External eToro agentPortfolioId UUID, not a dbzero UUID.
     agent_portfolio_id: str
+    # External eToro numeric agentPortfolioGcid represented as text.
     agent_portfolio_gcid: str
+    # Child credential's broker account identity; eToro owner adapter uses the agent GCID.
     agent_trading_account_id: str
+    # Child credential's broker portfolio identity; eToro owner adapter uses agentPortfolioId.
     agent_trading_portfolio_id: str
+    # External eToro numeric mirrorId for the copy relationship, represented as text.
     mirror_id: str
     investment_usd: Decimal
     virtual_balance_usd: Decimal
+    # Secret child credential, not an identifier.
     child_user_key: str
     scopes: frozenset[str]
     portfolio_name: str = ""
@@ -39,6 +50,7 @@ class OwnerBroker(Protocol):
     def create_portfolio(
         self,
         *,
+        # Locally generated correlation UUID sent to eToro as x-request-id, not a memo ID.
         request_id: str,
         investment_usd: Decimal,
         name: str,
@@ -91,7 +103,7 @@ class OwnerAdminService:
         if existing is not None:
             return {
                 "request_id": existing.request_id,
-                "state": existing.state,
+                "state": str(existing.state),
                 "agent_portfolio_id": existing.agent_portfolio_id or None,
                 "error_code": existing.error_code or None,
             }
@@ -107,7 +119,7 @@ class OwnerAdminService:
             request_id,
             self.store.trader_hash(trader_id),
             portfolio_name,
-            str(investment),
+            investment,
             sorted(scopes),
         )
         self.store.tag(intent, key_tag, f"provision-request:{request_id}", "PROVISIONING")
@@ -124,17 +136,19 @@ class OwnerAdminService:
                 scopes=scopes,
             )
         except TraderError as exc:
-            intent.state = "UNKNOWN" if exc.code == "BROKER_OUTCOME_UNKNOWN" else "REJECTED"
+            intent.state = (
+                ProvisioningState.UNKNOWN if exc.code == "BROKER_OUTCOME_UNKNOWN" else ProvisioningState.REJECTED
+            )
             intent.error_code = exc.code
             self.store.commit(self.store.control_prefix)
             return {
                 "request_id": request_id,
-                "state": intent.state,
+                "state": str(intent.state),
                 "agent_portfolio_id": None,
                 "error_code": intent.error_code,
             }
         if created.investment_usd != investment or created.scopes != scopes:
-            intent.state = "REPAIR_REQUIRED"
+            intent.state = ProvisioningState.REPAIR_REQUIRED
             intent.error_code = "PORTFOLIO_SCOPE_MISMATCH"
             self.store.commit(self.store.control_prefix)
             raise TraderError(
@@ -144,7 +158,7 @@ class OwnerAdminService:
         secret_reference = vault.put(f"agent-portfolio:{created.agent_portfolio_id}", created.child_user_key)
         intent.agent_portfolio_id = created.agent_portfolio_id
         intent.credential_reference = secret_reference
-        intent.state = "SECRET_PERSISTED"
+        intent.state = ProvisioningState.SECRET_PERSISTED
         self.store.commit(self.store.control_prefix)
         evidence = ScopeEvidence(
             scopes=created.scopes,
@@ -165,7 +179,7 @@ class OwnerAdminService:
             virtual_balance_usd=created.virtual_balance_usd,
             child_user_key_fingerprint=fingerprint(created.child_user_key),
         )
-        intent.state = "READY"
+        intent.state = ProvisioningState.READY
         self.store.append_control_event(
             "PROVISIONING_READY",
             {"request_id": request_id, "agent_portfolio_id": created.agent_portfolio_id},
@@ -173,7 +187,7 @@ class OwnerAdminService:
         self.store.commit(self.store.control_prefix)
         return {
             "request_id": request_id,
-            "state": intent.state,
+            "state": str(intent.state),
             "agent_portfolio_id": created.agent_portfolio_id,
             "credential_reference": secret_reference,
         }
@@ -189,8 +203,8 @@ class OwnerAdminService:
         )
         if intent is None:
             raise TraderError("NOT_FOUND", "provisioning request not found")
-        if intent.state != "UNKNOWN":
-            return {"request_id": intent.request_id, "state": intent.state}
+        if intent.state != ProvisioningState.UNKNOWN:
+            return {"request_id": intent.request_id, "state": str(intent.state)}
         candidates = [
             item
             for item in broker.list_portfolios()
@@ -224,28 +238,28 @@ class OwnerAdminService:
         virtual_balance = money(virtual_balance_usd)
         if investment <= 0 or virtual_balance <= 0:
             raise TraderError("INVALID_AMOUNT", "investment and virtual balance must be positive")
-        storage_key = self.store.register(trader_id, service_credential)
-        prefix = self.store.trader_prefix(storage_key)
-        state = self.store.state(prefix, trader_id)
+        registration = self.store.register(trader_id, service_credential)
+        prefix = self.store.trader_prefix(registration.storage_key)
+        state = self.store.state(prefix, registration.trader)
         binding = self.store.binding(prefix)
         if binding.binding_version and binding.agent_portfolio_id != agent_portfolio_id:
             raise TraderError("ALREADY_INITIALIZED", "trader already has a different immutable binding")
-        binding.environment = self.environment.value
-        binding.trader_id = trader_id
+        binding.environment = state.environment
+        binding.trader = registration.trader
         binding.owner_account_id = owner_account_id
         binding.agent_portfolio_id = agent_portfolio_id
         binding.agent_portfolio_gcid = agent_portfolio_gcid
         binding.agent_trading_account_id = evidence.trading_account_id
         binding.agent_trading_portfolio_id = evidence.trading_portfolio_id
         binding.mirror_id = mirror_id
-        binding.investment_usd = str(investment)
-        binding.virtual_balance_usd = str(virtual_balance)
-        binding.lifecycle = Lifecycle.READY.value
+        binding.investment_usd = investment
+        binding.virtual_balance_usd = virtual_balance
+        binding.lifecycle = Lifecycle.READY
         binding.binding_version = max(1, int(binding.binding_version))
         binding.copy_healthy = True
         binding.credential_fingerprint = child_user_key_fingerprint
         binding.scope_names = sorted(evidence.scopes)
-        binding.verified_at = utc_now().isoformat()
+        binding.verified_at = utc_now()
         self.store.record_scope_evidence(child_user_key_fingerprint, evidence)
         self.store.append_audit(
             prefix,
@@ -260,7 +274,7 @@ class OwnerAdminService:
             },
         )
         self.store.commit(prefix)
-        return {"trader_id": trader_id, "lifecycle": binding.lifecycle, "binding_version": binding.binding_version}
+        return {"trader_id": trader_id, "lifecycle": str(binding.lifecycle), "binding_version": binding.binding_version}
 
     def set_suspended(self, *, trader_id: str, suspended: bool) -> dict[str, object]:
         registration = self.store.one(
@@ -271,14 +285,12 @@ class OwnerAdminService:
         if registration is None:
             raise TraderError("NOT_FOUND", "trader not found")
         prefix = self.store.trader_prefix(str(registration.storage_key))
-        state = self.store.state(prefix, trader_id)
+        state = self.store.state(prefix, registration.trader)
         binding = self.store.binding(prefix)
-        if binding.lifecycle == Lifecycle.RETIRED.value:
+        if binding.lifecycle == Lifecycle.RETIRED:
             raise TraderError("PORTFOLIO_SUSPENDED", "retired portfolio cannot be reactivated")
         binding.lifecycle = (
-            Lifecycle.SUSPENDED.value
-            if suspended
-            else (Lifecycle.ACTIVE.value if state.initialized else Lifecycle.READY.value)
+            Lifecycle.SUSPENDED if suspended else (Lifecycle.ACTIVE if state.initialized else Lifecycle.READY)
         )
         self.store.append_audit(
             prefix,
@@ -287,7 +299,7 @@ class OwnerAdminService:
             actor="owner-admin",
         )
         self.store.commit(prefix)
-        return {"trader_id": trader_id, "lifecycle": binding.lifecycle}
+        return {"trader_id": trader_id, "lifecycle": str(binding.lifecycle)}
 
     def verify_control_audit(self) -> dict[str, object]:
         return self.store.verify_control_audit()
@@ -308,20 +320,20 @@ class OwnerAdminService:
         if registration is None:
             raise TraderError("NOT_FOUND", "trader not found")
         prefix = self.store.trader_prefix(str(registration.storage_key))
-        state = self.store.state(prefix, trader_id)
+        state = self.store.state(prefix, registration.trader)
         binding = self.store.binding(prefix)
         realized = money(actual_realized_pnl_usd, allow_negative=True)
         committed = money(actual_committed_usd)
-        state.owner_realized = str(realized)
-        state.owner_committed = str(committed)
+        state.owner_realized = realized
+        state.owner_committed = committed
         binding.copy_healthy = bool(copy_healthy)
         self.store.open(prefix)
         entry = LedgerEntry(
-            "owner_mirror",
-            "RECONCILED_ACTUAL",
-            str(realized),
+            LedgerDomain.owner_mirror,
+            LedgerKind.RECONCILED_ACTUAL,
+            realized,
             None,
-            utc_now().isoformat(),
+            utc_now(),
         )
         self.store.tag(entry, "LEDGER")
         self.store.append_audit(prefix, state, kind="MIRROR_RECONCILED", actor="owner-admin", source="reconcile")

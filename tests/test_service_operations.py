@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from trader_api.domain import IntentState
 from trader_api.errors import TraderError
 from trader_api.service import TraderService
-from trader_api.storage import Preview
+from trader_api.storage import Operation, Preview
 
 
 def _service(runtime: dict[str, object]) -> TraderService:
@@ -96,11 +94,11 @@ def test_full_close_omits_units_but_partial_close_sends_them(runtime: dict[str, 
     service.initialize("2000")
     _open(service)
     full = service.preview_close(position_id="601", fraction="1")
-    full_params = json.loads(service._api_reference(full["preview_id"], Preview).params_json)
-    assert "UnitsToDeduct" not in service._mutation("close", full_params, "request").payload
+    full_params = service._api_reference(full["preview_id"], Preview).params
+    assert "UnitsToDeduct" not in service._mutation(Operation.close, full_params, "request").payload
     partial = service.preview_close(position_id="601", fraction="0.5")
-    partial_params = json.loads(service._api_reference(partial["preview_id"], Preview).params_json)
-    assert service._mutation("close", partial_params, "request").payload["UnitsToDeduct"]
+    partial_params = service._api_reference(partial["preview_id"], Preview).params
+    assert service._mutation(Operation.close, partial_params, "request").payload["UnitsToDeduct"]
 
 
 def test_local_suspension_blocks_exposure_but_preserves_risk_reduction(

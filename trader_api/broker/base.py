@@ -9,6 +9,7 @@ from ..domain import BrokerMutation, BrokerOutcome, ScopeEvidence, VerifiedConte
 
 @dataclass(frozen=True, slots=True)
 class InstrumentSizing:
+    # External eToro numeric instrumentId from eligibility, for quotes/costs/orders; not a memo ID.
     instrument_id: int
     amount_usd: Decimal
     units: Decimal
@@ -34,6 +35,7 @@ class BrokerAdapter(Protocol):
         *,
         context: VerifiedContext,
         symbol: str | None,
+        # External eToro instrument catalogue ID, not a memo ID.
         instrument_id: int | None,
         strategy_notional_usd: Decimal,
         leverage: int,
@@ -45,10 +47,25 @@ class BrokerAdapter(Protocol):
 
     def dispatch(self, context: VerifiedContext, mutation: BrokerMutation) -> BrokerOutcome: ...
 
-    def lookup_request(self, context: VerifiedContext, request_id: str) -> BrokerOutcome | None: ...
+    def lookup_request(
+        self,
+        context: VerifiedContext,
+        # Locally generated x-request-id correlation UUID queried via eToro referenceId.
+        request_id: str,
+    ) -> BrokerOutcome | None: ...
 
-    def lookup_order(self, context: VerifiedContext, order_id: str) -> BrokerOutcome | None: ...
+    def lookup_order(
+        self,
+        context: VerifiedContext,
+        # External eToro numeric order ID represented as text.
+        order_id: str,
+    ) -> BrokerOutcome | None: ...
 
-    def lookup_close_order(self, context: VerifiedContext, order_id: str) -> BrokerOutcome | None: ...
+    def lookup_close_order(
+        self,
+        context: VerifiedContext,
+        # External eToro numeric close-order ID represented as text.
+        order_id: str,
+    ) -> BrokerOutcome | None: ...
 
     def reconcile(self, context: VerifiedContext) -> dict[str, object]: ...

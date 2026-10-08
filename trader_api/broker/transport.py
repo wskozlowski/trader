@@ -6,6 +6,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import suppress
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -76,7 +79,9 @@ class HttpTransport:
         self,
         route: Route,
         *,
+        # Caller correlation value sent as x-request-id; a local UUID is generated if absent.
         request_id: str | None = None,
+        # External numeric eToro orderId/positionId path values, not memo IDs.
         path_values: dict[str, int] | None = None,
         params: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
@@ -110,7 +115,17 @@ class HttpTransport:
         except httpx.HTTPError as exc:
             raise TraderError("BROKER_UNAVAILABLE", "broker transport failed", retryable=True) from exc
         if response.status_code == 429:
-            raise TraderError("BROKER_RATE_LIMITED", "broker rate limit reached", retryable=True)
+            retry_after = response.headers.get("retry-after", "")
+            seconds: float | None = None
+            try:
+                seconds = float(int(retry_after))
+            except ValueError:
+                with suppress(ValueError, TypeError, OverflowError):
+                    seconds = (parsedate_to_datetime(retry_after) - datetime.now(UTC)).total_seconds()
+            raise TraderError(
+                "BROKER_RATE_LIMITED", "broker rate limit reached", retryable=True,
+                details={} if seconds is None else {"retry_after_seconds": max(0, seconds)},
+            )
         if response.status_code in {401, 403}:
             raise TraderError("PERMISSION_REVOKED", "broker rejected the verified credential")
         if response.is_redirect:

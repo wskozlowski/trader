@@ -31,6 +31,7 @@ class EtoroOwnerBroker:
         method: str,
         url: str,
         *,
+        # Locally generated correlation UUID sent as eToro x-request-id, not a memo ID.
         request_id: str,
         json_body: dict[str, Any] | None = None,
     ) -> tuple[int, dict[str, Any]]:
@@ -63,6 +64,7 @@ class EtoroOwnerBroker:
     def create_portfolio(
         self,
         *,
+        # Locally generated correlation UUID sent as eToro x-request-id, not a memo ID.
         request_id: str,
         investment_usd: Decimal,
         name: str,

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from ..config import Profile
+from ..config import Profile, route_environment
 from ..domain import BrokerMutation, BrokerOutcome, IntentState, VerifiedContext, decimal_value, money
 from ..errors import TraderError
 from .base import InstrumentSizing
+from .observations import PortfolioObservation, normalize_portfolio
 from .transport import HttpTransport
 
 
@@ -257,6 +259,15 @@ class EtoroBrokerAdapter:
         if route is None:
             raise TraderError("CONFIG_INVALID", "reconciliation route is missing")
         return self.transport.request(route)
+
+    def collect_portfolio(self, context: VerifiedContext, observed_at: datetime) -> PortfolioObservation:
+        """Read only the bound child portfolio; do not run execution reconciliation."""
+        if not context.can_read or context.environment != route_environment(self.profile):
+            raise TraderError("PERMISSION_REQUIRED", "verified environment read scope is required")
+        route = self.profile.route("ETORO_PNL_URL")
+        if route is None:
+            raise TraderError("CONFIG_INVALID", "portfolio read route is missing")
+        return normalize_portfolio(self.transport.request(route), context, observed_at)
 
 
 def _order_type(value: str) -> str:

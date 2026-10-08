@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,18 +17,33 @@ from .auth import ControlScopeVerifier, ScopeVerifier, resolve_context
 from .broker import BrokerAdapter, EtoroBrokerAdapter
 from .broker.etoro import open_payload
 from .config import Profile, fixed_storage_root, load_profile
-from .domain import BrokerMutation, BrokerOutcome, Budget, IntentState, Lifecycle, money, utc_now
+from .domain import BrokerMutation, BrokerOutcome, Budget, IntentState, money, utc_now
 from .errors import TraderError
+from .serialization import api_value, canonical_json, native_copy, storage_datetime
 from .storage import (
     AuditEvent,
+    Currency,
     DbzeroStore,
+    ExecutionState,
     Intent,
+    LedgerDomain,
     LedgerEntry,
+    LedgerKind,
+    Lifecycle,
+    Operation,
     Order,
+    PortfolioBinding,
     Position,
+    PositionState,
     Preview,
     Reservation,
+    ReservationState,
+    Side,
+    Trader,
+    TraderState,
+    _runtime_lock,
 )
+from .ui_api.updates import record_operation
 
 _submission_locks: dict[str, threading.RLock] = {}
 _submission_locks_guard = threading.Lock()
@@ -40,7 +55,7 @@ def _submission_lock(key: str) -> threading.RLock:
 
 
 def _json(data: Any) -> str:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+    return canonical_json(data)
 
 
 class TraderService:
@@ -78,12 +93,15 @@ class TraderService:
         self.broker = broker or EtoroBrokerAdapter(self.profile)
         self.store: DbzeroStore | None = None
         self.storage_key: str | None = None
+        self.trader: Trader | None = None
         self.prefix: str | None = None
         if self._context is not None:
             root = storage_root or fixed_storage_root(self._context.environment)
             self.store = DbzeroStore(root, self._context.environment)
             self.store.assert_prefix_isolation()
-            self.storage_key = self.store.authenticate(self.trader_id, self.profile.service_credential)
+            registration = self.store.authenticate(self.trader_id, self.profile.service_credential)
+            self.trader = registration.trader
+            self.storage_key = registration.storage_key
             self.prefix = self.store.trader_prefix(self.storage_key)
 
     @property
@@ -96,22 +114,22 @@ class TraderService:
         if self._context is None or self.store is None or self.prefix is None or self.storage_key is None:
             raise TraderError("ENVIRONMENT_UNVERIFIED", "runtime context is not verified")
 
-    def _objects(self) -> tuple[Any, Any]:
+    def _objects(self) -> tuple[TraderState, PortfolioBinding]:
         self._require_context()
-        assert self.store is not None and self.prefix is not None
-        return self.store.state(self.prefix, self.trader_id), self.store.binding(self.prefix)
+        assert self.store is not None and self.prefix is not None and self.trader is not None
+        return self.store.state(self.prefix, self.trader), self.store.binding(self.prefix)
 
     def _validate_binding(
         self, *, active: bool = False, write: bool = False, reduction: bool = False
-    ) -> tuple[Any, Any]:
+    ) -> tuple[TraderState, PortfolioBinding]:
         self._require_context()
         assert self._context is not None
         state, binding = self._objects()
         if not binding.binding_version:
             raise TraderError("PORTFOLIO_NOT_BOUND", "no owner-provisioned portfolio is bound")
-        if binding.trader_id != self.trader_id:
+        if binding.trader != self.trader:
             raise TraderError("TRADER_MISMATCH", "binding belongs to a different trader")
-        if binding.environment != self._context.environment.value:
+        if binding.environment != state.environment:
             raise TraderError("PORTFOLIO_SCOPE_MISMATCH", "binding environment does not match token scopes")
         if (
             binding.agent_trading_account_id != self._context.trading_account_id
@@ -120,10 +138,10 @@ class TraderService:
             raise TraderError("ACCOUNT_MISMATCH", "verified child identity does not match the binding")
         if binding.credential_fingerprint != self._context.credential_fingerprint:
             raise TraderError("PORTFOLIO_SCOPE_MISMATCH", "child credential rotation is not verified for this binding")
-        lifecycle = Lifecycle(binding.lifecycle)
-        if lifecycle is Lifecycle.RETIRED or (lifecycle is Lifecycle.SUSPENDED and not reduction):
+        lifecycle = binding.lifecycle
+        if lifecycle == Lifecycle.RETIRED or (lifecycle == Lifecycle.SUSPENDED and not reduction):
             raise TraderError("PORTFOLIO_SUSPENDED", "portfolio is not permitted to accept operations")
-        active_lifecycle = lifecycle is Lifecycle.ACTIVE or (reduction and lifecycle is Lifecycle.SUSPENDED)
+        active_lifecycle = lifecycle == Lifecycle.ACTIVE or (reduction and lifecycle == Lifecycle.SUSPENDED)
         if active and (not state.initialized or not active_lifecycle):
             raise TraderError("NOT_INITIALIZED", "activate the existing portfolio binding first")
         if write and not self._context.can_write:
@@ -153,12 +171,12 @@ class TraderService:
         effective = {name: bool(enabled and self._context.can_write) for name, enabled in broker_caps.items()}
         try:
             state, binding = self._validate_binding()
-            ready = bool(binding.copy_healthy and binding.lifecycle in {Lifecycle.READY.value, Lifecycle.ACTIVE.value})
+            ready = bool(binding.copy_healthy and binding.lifecycle in {Lifecycle.READY, Lifecycle.ACTIVE})
             effective = {name: value and ready for name, value in effective.items()}
             lifecycle = binding.lifecycle
             initialized = bool(state.initialized)
         except TraderError:
-            lifecycle = Lifecycle.UNBOUND.value
+            lifecycle = Lifecycle.UNBOUND
             initialized = False
             effective = {name: False for name in effective}
         return {
@@ -166,7 +184,7 @@ class TraderService:
             "environment_verified": True,
             "scope_read": self._context.can_read,
             "scope_write": self._context.can_write,
-            "lifecycle": lifecycle,
+            "lifecycle": str(lifecycle),
             "initialized": initialized,
             "documented": documented,
             "configured": broker_caps,
@@ -179,7 +197,7 @@ class TraderService:
                 "trader_id": self.trader_id,
                 "environment": None,
                 "environment_verified": False,
-                "lifecycle": Lifecycle.UNBOUND.value,
+                "lifecycle": str(Lifecycle.UNBOUND),
                 "readiness_error": None if self._startup_error is None else self._startup_error.code,
             }
         state, binding = self._objects()
@@ -197,30 +215,30 @@ class TraderService:
             "trader_id": self.trader_id,
             "environment": self.environment,
             "environment_verified": True,
-            "lifecycle": binding.lifecycle,
+            "lifecycle": str(binding.lifecycle),
             "initialized": bool(state.initialized),
-            "currency": state.currency,
-            "owner_copy_investment_usd": binding.investment_usd,
-            "strategy_virtual_balance_usd": binding.virtual_balance_usd,
+            "currency": str(state.currency),
+            "owner_copy_investment_usd": str(binding.investment_usd),
+            "strategy_virtual_balance_usd": str(binding.virtual_balance_usd),
             "strategy_budget": strategy.as_dict(),
             "owner_mirror_budget": owner.as_dict(),
             "copy_healthy": bool(binding.copy_healthy),
             "scope_status": "read_write" if self._context.can_write else "read_only",
-            "verified_at": binding.verified_at,
+            "verified_at": api_value(binding.verified_at),
         }
 
     def portfolio(self) -> dict[str, Any]:
         state, binding = self._validate_binding()
         return {
             "trader_id": self.trader_id,
-            "environment": binding.environment,
+            "environment": str(binding.environment).lower() if binding.environment is not None else None,
             "agent_portfolio_id": binding.agent_portfolio_id,
             "agent_portfolio_gcid": binding.agent_portfolio_gcid,
-            "lifecycle": binding.lifecycle,
+            "lifecycle": str(binding.lifecycle),
             "binding_version": binding.binding_version,
             "policy_version": state.policy_version,
-            "owner_copy_investment_usd": binding.investment_usd,
-            "strategy_virtual_balance_usd": binding.virtual_balance_usd,
+            "owner_copy_investment_usd": str(binding.investment_usd),
+            "strategy_virtual_balance_usd": str(binding.virtual_balance_usd),
             "copy_healthy": bool(binding.copy_healthy),
         }
 
@@ -232,21 +250,21 @@ class TraderService:
         if expected != money(binding.investment_usd):
             raise TraderError("ACCOUNT_MISMATCH", "expected investment does not match owner-approved copy investment")
         if state.initialized:
-            if state.owner_initial_cap == str(expected) and state.currency == currency:
+            if state.owner_initial_cap == expected and state.currency == Currency.USD:
                 return self.trader_status()
             raise TraderError("ALREADY_INITIALIZED", "portfolio activation parameters are immutable")
-        if not binding.copy_healthy or binding.lifecycle != Lifecycle.READY.value:
+        if not binding.copy_healthy or binding.lifecycle != Lifecycle.READY:
             raise TraderError("PORTFOLIO_NOT_READY", "portfolio identity and copy relationship must be ready")
         assert (
             self.broker is not None and self._context is not None and self.store is not None and self.prefix is not None
         )
         self.broker.verify_identity(self._context)
-        with db0.atomic():
+        with self.store.transaction(self.prefix):
             state.initialized = True
-            state.currency = "USD"
-            state.owner_initial_cap = str(expected)
-            state.strategy_initial_cap = str(min(expected, money(binding.virtual_balance_usd)))
-            binding.lifecycle = Lifecycle.ACTIVE.value
+            state.currency = Currency.USD
+            state.owner_initial_cap = expected
+            state.strategy_initial_cap = min(expected, money(binding.virtual_balance_usd))
+            binding.lifecycle = Lifecycle.ACTIVE
             self.store.append_audit(
                 self.prefix,
                 state,
@@ -254,10 +272,9 @@ class TraderService:
                 actor=self.trader_id,
                 facts={"expected_investment_usd": str(expected), "currency": currency},
             )
-        self.store.commit(self.prefix)
         return self.trader_status()
 
-    def _budget_pair(self, state: Any) -> tuple[Budget, Budget]:
+    def _budget_pair(self, state: TraderState) -> tuple[Budget, Budget]:
         return (
             Budget(
                 money(state.strategy_initial_cap),
@@ -272,38 +289,44 @@ class TraderService:
         )
 
     def _persist_preview(
-        self, operation: str, params: dict[str, Any], state: Any, binding: Any, fingerprint: str
+        self,
+        operation: Operation,
+        params: dict[str, Any],
+        state: TraderState,
+        binding: PortfolioBinding,
+        fingerprint: str,
     ) -> dict[str, Any]:
         assert self.store is not None and self.prefix is not None
-        created = self._clock()
+        created = storage_datetime(self._clock())
         expires = created + timedelta(minutes=5)
         self.store.open(self.prefix)
         preview = Preview(
             operation,
-            _json(params),
-            created.isoformat(),
-            expires.isoformat(),
+            native_copy(params),
+            created,
+            expires,
             fingerprint,
             int(binding.binding_version),
             int(state.policy_version),
         )
-        self.store.tag(preview, "PREVIEW", f"operation:{operation}")
+        self.store.tag(preview, "PREVIEW")
         self.store.commit(self.prefix)
         return {
             "preview_id": str(db0.uuid(preview)),
-            "operation": operation,
+            "operation": str(operation),
             "created_at": created.isoformat(),
             "expires_at": expires.isoformat(),
             "binding_version": binding.binding_version,
             "policy_version": state.policy_version,
             "broker_state_fingerprint": fingerprint,
-            **params,
+            **api_value(params),
         }
 
     def preview_open(
         self,
         *,
         symbol: str | None = None,
+        # External eToro numeric instrument catalogue ID, not a memo ID.
         instrument_id: int | None = None,
         side: str,
         order_type: str = "market",
@@ -363,54 +386,63 @@ class TraderService:
             "instrument_id": sizing.instrument_id,
             "side": side,
             "order_type": order_type,
-            "strategy_notional_usd": str(sizing.full_notional_usd),
-            "broker_amount_usd": str(sizing.amount_usd),
-            "broker_units": str(sizing.units),
+            "strategy_notional_usd": sizing.full_notional_usd,
+            "broker_amount_usd": sizing.amount_usd,
+            "broker_units": sizing.units,
             "leverage": leverage,
-            "estimated_strategy_cost_usd": str(strategy_cost),
-            "estimated_owner_copied_notional_usd": str(admission.estimated_owner_notional),
-            "estimated_owner_cost_usd": str(owner_cost),
-            "strategy_reservation_usd": str(admission.strategy_reservation),
-            "owner_reservation_usd": str(admission.owner_reservation),
-            "strategy_remaining_budget_usd": str(admission.strategy_remaining),
-            "owner_remaining_budget_usd": str(admission.owner_remaining),
+            "estimated_strategy_cost_usd": strategy_cost,
+            "estimated_owner_copied_notional_usd": admission.estimated_owner_notional,
+            "estimated_owner_cost_usd": owner_cost,
+            "strategy_reservation_usd": admission.strategy_reservation,
+            "owner_reservation_usd": admission.owner_reservation,
+            "strategy_remaining_budget_usd": admission.strategy_remaining,
+            "owner_remaining_budget_usd": admission.owner_remaining,
             "broker_payload": payload,
         }
-        return self._persist_preview("open", params, state, binding, fingerprint)
+        return self._persist_preview(Operation.open, params, state, binding, fingerprint)
 
     def _owned_position(self, position_id: str) -> Position:
         assert self.store is not None and self.prefix is not None
         position = self.store.one(Position, position_id, prefix=self.prefix)
-        if position is None or position.state != "OPEN":
+        if position is None or position.state != PositionState.OPEN:
             raise TraderError("NOT_FOUND", "position not found")
         return position
 
     def _owned_order(self, order_id: str) -> Order:
         assert self.store is not None and self.prefix is not None
         order = self.store.one(Order, order_id, prefix=self.prefix)
-        if order is None or order.state not in {"PENDING", "ACKNOWLEDGED"}:
+        if order is None or order.state not in {ExecutionState.PENDING, ExecutionState.ACKNOWLEDGED}:
             raise TraderError("NOT_FOUND", "order not found")
         return order
 
-    def preview_close(self, *, position_id: str, fraction: object = "1") -> dict[str, Any]:
+    def preview_close(
+        self,
+        *,
+        # External eToro numeric position ID represented as text, not a memo ID.
+        position_id: str,
+        fraction: object = "1",
+    ) -> dict[str, Any]:
         state, binding = self._validate_binding(active=True, write=True, reduction=True)
         position = self._owned_position(position_id)
         close_fraction = Decimal(str(fraction))
         if not close_fraction.is_finite() or close_fraction <= 0 or close_fraction > 1:
             raise TraderError("INVALID_AMOUNT", "fraction must be in (0, 1]")
-        units = Decimal(str(position.units)) * close_fraction
+        units = position.units * close_fraction
         params = {
             "position_id": position_id,
-            "fraction": str(close_fraction),
-            "units_to_deduct": str(units),
+            "fraction": close_fraction,
+            "units_to_deduct": units,
             "instrument_id": int(position.instrument_id),
         }
         assert self._context is not None
-        return self._persist_preview("close", params, state, binding, self.broker.state_fingerprint(self._context))
+        return self._persist_preview(
+            Operation.close, params, state, binding, self.broker.state_fingerprint(self._context)
+        )
 
     def preview_modify(
         self,
         *,
+        # External eToro numeric position ID represented as text, not a memo ID.
         position_id: str,
         stop_loss_rate: object | None = None,
         take_profit_rate: object | None = None,
@@ -424,19 +456,26 @@ class TraderService:
             raise TraderError("INVALID_ORDER", "unsupported stop-loss type")
         params = {
             "position_id": position_id,
-            "stop_loss_rate": None if stop_loss_rate is None else str(money(stop_loss_rate)),
-            "take_profit_rate": None if take_profit_rate is None else str(money(take_profit_rate)),
+            "stop_loss_rate": None if stop_loss_rate is None else money(stop_loss_rate),
+            "take_profit_rate": None if take_profit_rate is None else money(take_profit_rate),
             "stop_loss_type": stop_loss_type,
         }
         assert self._context is not None
-        return self._persist_preview("modify", params, state, binding, self.broker.state_fingerprint(self._context))
+        return self._persist_preview(
+            Operation.modify, params, state, binding, self.broker.state_fingerprint(self._context)
+        )
 
-    def preview_cancel(self, *, order_id: str) -> dict[str, Any]:
+    def preview_cancel(
+        self,
+        *,
+        # External eToro numeric order ID represented as text, not a memo ID.
+        order_id: str,
+    ) -> dict[str, Any]:
         state, binding = self._validate_binding(active=True, write=True, reduction=True)
         self._owned_order(order_id)
         assert self._context is not None
         return self._persist_preview(
-            "cancel", {"order_id": order_id}, state, binding, self.broker.state_fingerprint(self._context)
+            Operation.cancel, {"order_id": order_id}, state, binding, self.broker.state_fingerprint(self._context)
         )
 
     def _api_reference[T](self, identifier: str, model: type[T]) -> T:
@@ -452,10 +491,16 @@ class TraderService:
         return cast(T, item)
 
     def _validate_preview(self, preview: Preview) -> None:
-        if datetime.fromisoformat(preview.expires_at).astimezone(UTC) <= self._clock():
+        if preview.expires_at.astimezone(UTC) <= self._clock():
             raise TraderError("STALE_PREVIEW", "preview expired")
 
-    def submit(self, preview_id: str, idempotency_key: str) -> dict[str, Any]:
+    def submit(
+        self,
+        # Preview's dbzero UUID serialized at the API boundary; internal links use instances.
+        preview_id: str,
+        # Caller-supplied local submission deduplication key, not a broker identifier.
+        idempotency_key: str,
+    ) -> dict[str, Any]:
         if not idempotency_key or len(idempotency_key) > 200:
             raise TraderError("INVALID_IDEMPOTENCY_KEY", "a bounded idempotency key is required")
         state, binding = self._validate_binding(active=True, write=True, reduction=True)
@@ -475,12 +520,14 @@ class TraderService:
                     raise TraderError("IDEMPOTENCY_CONFLICT", "idempotency key was used for another preview")
                 return self._intent_value(prior)
             self._validate_preview(preview)
-            state, binding = self._validate_binding(active=True, write=True, reduction=preview.operation != "open")
+            state, binding = self._validate_binding(
+                active=True, write=True, reduction=preview.operation != Operation.open
+            )
             if preview.binding_version != binding.binding_version or preview.policy_version != state.policy_version:
                 raise TraderError("STALE_PREVIEW", "binding or policy changed")
             if preview.state_fingerprint != self.broker.state_fingerprint(self._context):
                 raise TraderError("STALE_PREVIEW", "broker state changed")
-            params = json.loads(preview.params_json)
+            params = native_copy(preview.params)
             self._revalidate_admission(preview.operation, params, state, binding)
             request_id = str(uuid.uuid4())
             command_digest = hashlib.sha256(
@@ -491,37 +538,41 @@ class TraderService:
             strategy_reservation = money(params.get("strategy_reservation_usd", "0"))
             owner_reservation = money(params.get("owner_reservation_usd", "0"))
             self.store.open(self.prefix)
-            with db0.atomic():
+            with self.store.transaction(self.prefix):
                 intent = Intent(
                     preview,
                     idempotency_key,
                     preview.operation,
-                    preview.params_json,
+                    native_copy(preview.params),
                     request_id,
                     command_digest,
                     int(binding.binding_version),
                     int(state.policy_version),
+                    created_at=storage_datetime(self._clock()),
                 )
                 self.store.tag(intent, key_tag, "INTENT")
+                if preview.operation in {Operation.close, Operation.modify}:
+                    db0.tags(self._owned_position(params["position_id"])).add(db0.as_tag(intent))
+                elif preview.operation == Operation.cancel:
+                    db0.tags(self._owned_order(params["order_id"])).add(db0.as_tag(intent))
                 reservation = Reservation(
                     intent,
-                    str(strategy_reservation),
-                    str(owner_reservation),
+                    strategy_reservation,
+                    owner_reservation,
                     int(binding.binding_version),
                     int(state.policy_version),
                 )
                 self.store.tag(reservation, "RESERVATION")
-                state.strategy_committed = str(money(state.strategy_committed) + strategy_reservation)
-                state.owner_committed = str(money(state.owner_committed) + owner_reservation)
+                state.strategy_committed = money(state.strategy_committed) + strategy_reservation
+                state.owner_committed = money(state.owner_committed) + owner_reservation
                 self.store.append_audit(
                     self.prefix,
                     state,
                     kind="INTENT_COMMITTED",
                     actor=self.trader_id,
                     intent=intent,
-                    facts={"operation": preview.operation, "request_id": request_id},
+                    facts={"operation": str(preview.operation), "request_id": request_id},
                 )
-            self.store.commit(self.prefix)
             self._barrier_hook("trader_intent_committed")
 
             control = self.store.reserve_control(
@@ -530,8 +581,10 @@ class TraderService:
                 request_id=request_id,
                 binding_version=int(binding.binding_version),
             )
-            intent.state = IntentState.ADMITTED.value
-            self.store.commit(self.prefix)
+            with self.store.transaction(self.prefix):
+                self.store.open(self.prefix)
+                intent.state = ExecutionState.ADMITTED
+                record_operation(intent, self._clock())
             self._barrier_hook("control_reservation_committed")
 
             mutation = self._mutation(preview.operation, params, request_id)
@@ -556,8 +609,8 @@ class TraderService:
                         broker_id=broker_id,
                         storage_key=self.storage_key,
                     )
-            control.state = outcome.state.value
-            control.outcome_json = _json(outcome.as_dict())
+            control.state = getattr(ExecutionState, outcome.state.name)
+            control.outcome = {**asdict(outcome), "state": outcome.state.value}
             self.store.append_control_event(
                 "BROKER_OUTCOME_RECORDED",
                 {
@@ -573,8 +626,10 @@ class TraderService:
             self._barrier_hook("trader_outcome_projected")
             return self._intent_value(intent)
 
-    def _revalidate_admission(self, operation: str, params: dict[str, Any], state: Any, binding: Any) -> None:
-        if operation != "open":
+    def _revalidate_admission(
+        self, operation: Operation, params: dict[str, Any], state: TraderState, binding: PortfolioBinding
+    ) -> None:
+        if operation != Operation.open:
             return
         if not binding.copy_healthy:
             raise TraderError("COPY_DIVERGENCE", "owner mirror must be reconciled before new exposure")
@@ -584,20 +639,20 @@ class TraderService:
         if money(params["owner_reservation_usd"]) > owner.available_to_open:
             raise TraderError("INSUFFICIENT_BUDGET", "owner budget changed")
 
-    def _mutation(self, operation: str, params: dict[str, Any], request_id: str) -> BrokerMutation:
-        if operation == "open":
-            return BrokerMutation(request_id, operation, params["broker_payload"])
-        if operation == "close":
+    def _mutation(self, operation: Operation, params: dict[str, Any], request_id: str) -> BrokerMutation:
+        if operation == Operation.open:
+            return BrokerMutation(request_id, str(operation), api_value(params["broker_payload"]))
+        if operation == Operation.close:
             payload: dict[str, Any] = {"InstrumentID": params["instrument_id"]}
             if Decimal(params["fraction"]) < 1:
                 payload["UnitsToDeduct"] = params["units_to_deduct"]
             return BrokerMutation(
                 request_id,
-                operation,
-                payload,
+                str(operation),
+                api_value(payload),
                 params["position_id"],
             )
-        if operation == "modify":
+        if operation == Operation.modify:
             payload = {
                 key: value
                 for key, value in {
@@ -607,9 +662,9 @@ class TraderService:
                 }.items()
                 if value is not None
             }
-            return BrokerMutation(request_id, operation, payload, params["position_id"])
-        if operation == "cancel":
-            return BrokerMutation(request_id, operation, {}, params["order_id"])
+            return BrokerMutation(request_id, str(operation), api_value(payload), params["position_id"])
+        if operation == Operation.cancel:
+            return BrokerMutation(request_id, str(operation), {}, params["order_id"])
         raise TraderError("UNSUPPORTED_CAPABILITY", "unknown preview operation")
 
     def _project_outcome(
@@ -618,111 +673,146 @@ class TraderService:
         reservation: Reservation,
         outcome: BrokerOutcome,
         params: dict[str, Any],
-        state: Any,
-        binding: Any,
+        state: TraderState,
+        binding: PortfolioBinding,
+    ) -> None:
+        assert self.store is not None and self.prefix is not None
+        with _runtime_lock:
+            self.store.open(self.prefix)
+            with db0.atomic():
+                target_state = getattr(ExecutionState, outcome.state.name)
+                if (
+                    intent.projected_state in {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}
+                    and intent.projected_state != target_state
+                ):
+                    return
+                if intent.projected_state != target_state:
+                    self._apply_outcome(intent, reservation, outcome, params, state, binding)
+                    intent.projected_state = target_state
+                record_operation(intent, self._clock(), outcome)
+            self.store.commit(self.prefix)
+
+    def _apply_outcome(
+        self,
+        intent: Intent,
+        reservation: Reservation,
+        outcome: BrokerOutcome,
+        params: dict[str, Any],
+        state: TraderState,
+        binding: PortfolioBinding,
     ) -> None:
         assert self.store is not None and self.prefix is not None
         self.store.open(self.prefix)
-        intent.state = outcome.state.value
-        intent.broker_order_id = outcome.broker_order_id or ""
-        intent.broker_position_id = outcome.broker_position_id or ""
-        if outcome.state is IntentState.REJECTED or outcome.state is IntentState.CANCELED:
-            state.strategy_committed = str(
-                max(Decimal("0"), money(state.strategy_committed) - money(reservation.strategy_amount_usd))
+        intent.state = getattr(ExecutionState, outcome.state.name)
+        intent.broker_order_id = outcome.broker_order_id
+        intent.broker_position_id = outcome.broker_position_id
+        if outcome.state in {IntentState.REJECTED, IntentState.CANCELED} and reservation.state == ReservationState.HELD:
+            state.strategy_committed = max(
+                Decimal("0"), money(state.strategy_committed) - money(reservation.strategy_amount_usd)
             )
-            state.owner_committed = str(
-                max(Decimal("0"), money(state.owner_committed) - money(reservation.owner_amount_usd))
+
+            state.owner_committed = max(
+                Decimal("0"), money(state.owner_committed) - money(reservation.owner_amount_usd)
             )
-            reservation.state = "RELEASED"
-        if outcome.broker_order_id and intent.operation == "open":
+
+            reservation.state = ReservationState.RELEASED
+        if outcome.broker_order_id and intent.operation in {Operation.open, Operation.close}:
             order = self.store.one(Order, outcome.broker_order_id, prefix=self.prefix)
-            order_state = "PENDING" if outcome.state is IntentState.ACKNOWLEDGED else outcome.state.value
+            order_state = (
+                ExecutionState.PENDING
+                if outcome.state is IntentState.ACKNOWLEDGED
+                else getattr(ExecutionState, outcome.state.name)
+            )
             if order is None:
+                symbol = params.get("symbol") or ""
+                if intent.operation == Operation.close:
+                    symbol = self._owned_position(params["position_id"]).symbol
                 order = Order(
                     outcome.broker_order_id,
                     intent,
-                    params.get("symbol") or "",
+                    symbol,
                     order_state,
                 )
                 self.store.tag(order, "ORDER")
             else:
                 order.state = order_state
-        if intent.operation == "open" and outcome.state is IntentState.FILLED and outcome.broker_position_id:
+        if intent.operation == Operation.open and outcome.state is IntentState.FILLED and outcome.broker_position_id:
             estimated_strategy_cost = money(params["estimated_strategy_cost_usd"])
-            actual_strategy_cost = outcome.actual_cost_usd or estimated_strategy_cost
-            state.strategy_committed = str(money(state.strategy_committed) - estimated_strategy_cost)
-            state.strategy_realized = str(
-                money(
-                    money(state.strategy_realized, allow_negative=True) - actual_strategy_cost,
-                    allow_negative=True,
-                )
+            actual_strategy_cost = (
+                estimated_strategy_cost if outcome.actual_cost_usd is None else outcome.actual_cost_usd
             )
+            state.strategy_committed = money(state.strategy_committed) - estimated_strategy_cost
+            state.strategy_realized = money(
+                money(state.strategy_realized, allow_negative=True) - actual_strategy_cost,
+                allow_negative=True,
+            )
+
             position = Position(
                 outcome.broker_position_id,
                 intent,
                 params.get("symbol") or "",
-                params["side"],
+                getattr(Side, params["side"]),
                 int(params["instrument_id"]),
                 int(params["leverage"]),
-                params["strategy_notional_usd"],
-                str(outcome.filled_units or Decimal(params["broker_units"])),
+                money(params["strategy_notional_usd"]),
+                outcome.filled_units or Decimal(params["broker_units"]),
             )
             self.store.tag(position, "POSITION")
             entry = LedgerEntry(
-                "strategy",
-                "ACTUAL_FILL",
-                params["strategy_notional_usd"],
+                LedgerDomain.strategy,
+                LedgerKind.ACTUAL_FILL,
+                money(params["strategy_notional_usd"]),
                 intent,
-                self._clock().isoformat(),
+                self._clock(),
             )
             self.store.tag(entry, "LEDGER")
             binding.copy_healthy = False
-        elif intent.operation == "close" and outcome.state is IntentState.FILLED:
+        elif intent.operation == Operation.close and outcome.state is IntentState.FILLED:
             position = self._owned_position(params["position_id"])
+            db0.tags(position).add(db0.as_tag(intent))
             fraction = Decimal(params["fraction"])
-            released = money(Decimal(position.strategy_notional_usd) * fraction)
+            released = money(position.strategy_notional_usd * fraction)
             owner_released = copied_notional(
                 released, money(binding.investment_usd), money(binding.virtual_balance_usd)
             )
-            state.strategy_committed = str(max(Decimal("0"), money(state.strategy_committed) - released))
-            state.owner_committed = str(max(Decimal("0"), money(state.owner_committed) - owner_released))
+            state.strategy_committed = max(Decimal("0"), money(state.strategy_committed) - released)
+            state.owner_committed = max(Decimal("0"), money(state.owner_committed) - owner_released)
             if fraction == 1:
-                position.state = "CLOSED"
+                position.state = PositionState.CLOSED
             else:
-                position.strategy_notional_usd = str(money(Decimal(position.strategy_notional_usd) - released))
-                position.units = str(Decimal(position.units) - Decimal(params["units_to_deduct"]))
+                position.strategy_notional_usd = money(position.strategy_notional_usd - released)
+                position.units = position.units - Decimal(params["units_to_deduct"])
             if outcome.realized_pnl_usd is not None:
-                state.strategy_realized = str(
-                    money(
-                        money(state.strategy_realized, allow_negative=True) + outcome.realized_pnl_usd,
-                        allow_negative=True,
-                    )
+                state.strategy_realized = money(
+                    money(state.strategy_realized, allow_negative=True) + outcome.realized_pnl_usd,
+                    allow_negative=True,
                 )
+
             binding.copy_healthy = False
-        elif intent.operation == "cancel" and outcome.state in {IntentState.FILLED, IntentState.CANCELED}:
+        elif intent.operation == Operation.cancel and outcome.state in {IntentState.FILLED, IntentState.CANCELED}:
             order = self._owned_order(params["order_id"])
-            order.state = "CANCELED"
+            db0.tags(order).add(db0.as_tag(intent))
+            order.state = ExecutionState.CANCELED
             original_reservation = self.store.one(Reservation, db0.as_tag(order.intent), prefix=self.prefix)
-            if original_reservation is not None and original_reservation.state == "HELD":
-                state.strategy_committed = str(
-                    max(
-                        Decimal("0"),
-                        money(state.strategy_committed) - money(original_reservation.strategy_amount_usd),
-                    )
+            if original_reservation is not None and original_reservation.state == ReservationState.HELD:
+                state.strategy_committed = max(
+                    Decimal("0"),
+                    money(state.strategy_committed) - money(original_reservation.strategy_amount_usd),
                 )
-                state.owner_committed = str(
-                    max(
-                        Decimal("0"),
-                        money(state.owner_committed) - money(original_reservation.owner_amount_usd),
-                    )
+
+                state.owner_committed = max(
+                    Decimal("0"),
+                    money(state.owner_committed) - money(original_reservation.owner_amount_usd),
                 )
-                original_reservation.state = "RELEASED"
-        elif intent.operation == "modify" and outcome.state in {IntentState.FILLED, IntentState.ACKNOWLEDGED}:
+
+                original_reservation.state = ReservationState.RELEASED
+        elif intent.operation == Operation.modify and outcome.state in {IntentState.FILLED, IntentState.ACKNOWLEDGED}:
             position = self._owned_position(params["position_id"])
+            db0.tags(position).add(db0.as_tag(intent))
             if params["stop_loss_rate"] is not None:
-                position.stop_loss_rate = params["stop_loss_rate"]
+                position.stop_loss_rate = Decimal(params["stop_loss_rate"])
             if params["take_profit_rate"] is not None:
-                position.take_profit_rate = params["take_profit_rate"]
+                position.take_profit_rate = Decimal(params["take_profit_rate"])
         self.store.append_audit(
             self.prefix,
             state,
@@ -730,7 +820,7 @@ class TraderService:
             actor="coordinator",
             intent=intent,
             facts={
-                "operation": intent.operation,
+                "operation": str(intent.operation),
                 "request_id": outcome.request_id,
                 "order_id": outcome.broker_order_id,
                 "position_id": outcome.broker_position_id,
@@ -742,17 +832,21 @@ class TraderService:
     def _intent_value(self, intent: Intent) -> dict[str, Any]:
         return {
             "intent_id": str(db0.uuid(intent)),
-            "operation": intent.operation,
-            "state": intent.state,
+            "operation": str(intent.operation),
+            "state": str(intent.state),
             "request_id": intent.request_id,
             "broker_order_id": intent.broker_order_id or None,
             "broker_position_id": intent.broker_position_id or None,
-            "strategy_execution_state": intent.state,
-            "mirror_reconciliation_state": "PENDING" if intent.state == IntentState.FILLED.value else "UNCHANGED",
+            "strategy_execution_state": str(intent.state),
+            "mirror_reconciliation_state": "PENDING" if intent.state == ExecutionState.FILLED else "UNCHANGED",
             "error_code": intent.error_code or None,
         }
 
-    def intent_status(self, intent_id: str) -> dict[str, Any]:
+    def intent_status(
+        self,
+        # Intent's dbzero UUID serialized at the API boundary; internal links use instances.
+        intent_id: str,
+    ) -> dict[str, Any]:
         self._validate_binding(active=True)
         assert self.store is not None and self.prefix is not None
         intent = self._api_reference(intent_id, Intent)
@@ -765,17 +859,17 @@ class TraderService:
             {
                 "position_id": item.position_id,
                 "symbol": item.symbol,
-                "side": item.side,
+                "side": str(item.side),
                 "instrument_id": item.instrument_id,
                 "leverage": item.leverage,
-                "strategy_notional_usd": item.strategy_notional_usd,
-                "units": item.units,
-                "stop_loss_rate": item.stop_loss_rate or None,
-                "take_profit_rate": item.take_profit_rate or None,
-                "state": item.state,
+                "strategy_notional_usd": str(item.strategy_notional_usd),
+                "units": str(item.units),
+                "stop_loss_rate": str(item.stop_loss_rate) if item.stop_loss_rate is not None else None,
+                "take_profit_rate": str(item.take_profit_rate) if item.take_profit_rate is not None else None,
+                "state": str(item.state),
             }
             for item in self.store.all(Position, "POSITION", prefix=self.prefix)
-            if item.state == "OPEN"
+            if item.state == PositionState.OPEN
         ]
 
     def orders(self) -> list[dict[str, Any]]:
@@ -785,11 +879,11 @@ class TraderService:
             {
                 "order_id": item.order_id,
                 "symbol": item.symbol,
-                "state": item.state,
+                "state": str(item.state),
                 "intent_id": str(db0.uuid(item.intent)),
             }
             for item in self.store.all(Order, "ORDER", prefix=self.prefix)
-            if item.state in {"PENDING", "ACKNOWLEDGED"}
+            if item.state in {ExecutionState.PENDING, ExecutionState.ACKNOWLEDGED}
         ]
 
     def reconcile(self) -> dict[str, Any]:
@@ -805,62 +899,61 @@ class TraderService:
         controls = list(self.store.unresolved_control(self.storage_key))
         control_digests = {str(control.command_digest) for control in controls}
         for local_intent in self.store.all(Intent, "INTENT", prefix=self.prefix):
-            if local_intent.state == IntentState.COMMITTED.value and local_intent.command_digest not in control_digests:
-                local_reservation = self.store.one(Reservation, db0.as_tag(local_intent), prefix=self.prefix)
-                if local_reservation is not None and local_reservation.state == "HELD":
-                    state.strategy_committed = str(
-                        max(
+            if local_intent.state == ExecutionState.COMMITTED and local_intent.command_digest not in control_digests:
+                with self.store.transaction(self.prefix):
+                    local_reservation = self.store.one(Reservation, db0.as_tag(local_intent), prefix=self.prefix)
+                    if local_reservation is not None and local_reservation.state == ReservationState.HELD:
+                        state.strategy_committed = max(
                             Decimal("0"),
                             money(state.strategy_committed) - money(local_reservation.strategy_amount_usd),
                         )
-                    )
-                    state.owner_committed = str(
-                        max(
+
+                        state.owner_committed = max(
                             Decimal("0"),
                             money(state.owner_committed) - money(local_reservation.owner_amount_usd),
                         )
+
+                        local_reservation.state = ReservationState.RELEASED
+                    local_intent.state = ExecutionState.CANCELED
+                    self.store.append_audit(
+                        self.prefix,
+                        state,
+                        kind="ORPHAN_INTENT_CANCELED",
+                        actor="coordinator",
+                        intent=local_intent,
+                        source="reconcile",
                     )
-                    local_reservation.state = "RELEASED"
-                local_intent.state = IntentState.CANCELED.value
-                self.store.append_audit(
-                    self.prefix,
-                    state,
-                    kind="ORPHAN_INTENT_CANCELED",
-                    actor="coordinator",
-                    intent=local_intent,
-                    source="reconcile",
-                )
                 recovered += 1
         for control in controls:
             intent = self.store.one(Intent, control.request_id, prefix=self.prefix)
-            if control.state in {"RESERVED", IntentState.UNKNOWN.value}:
+            if control.state in {ExecutionState.RESERVED, ExecutionState.UNKNOWN}:
                 outcome = self.broker.lookup_request(self._context, control.request_id)
                 if outcome is None:
                     unresolved += 1
                     continue
-                control.state = outcome.state.value
-                control.outcome_json = _json(outcome.as_dict())
+                control.state = getattr(ExecutionState, outcome.state.name)
+                control.outcome = {**asdict(outcome), "state": outcome.state.value}
                 self.store.commit(self.store.control_prefix)
             elif (
-                control.state == IntentState.ACKNOWLEDGED.value
+                control.state == ExecutionState.ACKNOWLEDGED
                 and intent is not None
-                and intent.state == IntentState.ACKNOWLEDGED.value
+                and intent.state == ExecutionState.ACKNOWLEDGED
                 and intent.broker_order_id
             ):
                 outcome = (
                     self.broker.lookup_close_order(self._context, str(intent.broker_order_id))
-                    if intent.operation == "close"
+                    if intent.operation == Operation.close
                     else self.broker.lookup_order(self._context, str(intent.broker_order_id))
                 )
                 if outcome is None or outcome.state is IntentState.ACKNOWLEDGED:
                     continue
-                control.state = outcome.state.value
-                control.outcome_json = _json(outcome.as_dict())
+                control.state = getattr(ExecutionState, outcome.state.name)
+                control.outcome = {**asdict(outcome), "state": outcome.state.value}
                 self.store.commit(self.store.control_prefix)
-            elif control.outcome_json:
-                payload = json.loads(control.outcome_json)
+            elif control.outcome:
+                payload = native_copy(control.outcome)
                 outcome = BrokerOutcome(
-                    state=IntentState(payload["state"]),
+                    state=IntentState(str(payload["state"])),
                     request_id=payload["request_id"],
                     broker_order_id=payload.get("broker_order_id"),
                     broker_position_id=payload.get("broker_position_id"),
@@ -878,24 +971,24 @@ class TraderService:
             else:
                 continue
             if intent is not None and intent.state in {
-                IntentState.ADMITTED.value,
-                IntentState.UNKNOWN.value,
-                IntentState.ACKNOWLEDGED.value,
+                ExecutionState.ADMITTED,
+                ExecutionState.UNKNOWN,
+                ExecutionState.ACKNOWLEDGED,
             }:
                 reservation = self.store.one(Reservation, db0.as_tag(intent), prefix=self.prefix)
                 if reservation is not None:
-                    self._project_outcome(intent, reservation, outcome, json.loads(intent.params_json), state, binding)
+                    self._project_outcome(intent, reservation, outcome, native_copy(intent.params), state, binding)
                     recovered += 1
         snapshot = self.broker.reconcile(self._context)
-        self.store.append_audit(
-            self.prefix,
-            state,
-            kind="STRATEGY_RECONCILED",
-            actor="coordinator",
-            source="reconcile",
-            facts={"snapshot_fingerprint": hashlib.sha256(_json(snapshot).encode()).hexdigest()},
-        )
-        self.store.commit(self.prefix)
+        with self.store.transaction(self.prefix):
+            self.store.append_audit(
+                self.prefix,
+                state,
+                kind="STRATEGY_RECONCILED",
+                actor="coordinator",
+                source="reconcile",
+                facts={"snapshot_fingerprint": hashlib.sha256(_json(snapshot).encode()).hexdigest()},
+            )
         return {
             "recovered_intents": recovered,
             "unresolved_intents": unresolved,
@@ -912,12 +1005,12 @@ class TraderService:
             {
                 "event_id": str(db0.uuid(event)),
                 "sequence": event.sequence,
-                "occurred_at": event.occurred_at,
+                "occurred_at": event.occurred_at.isoformat(),
                 "kind": event.kind,
                 "actor": event.actor,
                 "intent_id": str(db0.uuid(event.intent)) if event.intent is not None else None,
                 "source": event.source,
-                "facts": json.loads(event.facts_json),
+                "facts": api_value(event.facts),
                 "previous_hash": event.previous_hash,
                 "event_hash": event.event_hash,
             }
@@ -935,13 +1028,13 @@ class TraderService:
         entries = sorted(self.store.all(LedgerEntry, "LEDGER", prefix=self.prefix), key=lambda item: item.occurred_at)
         result: dict[str, list[dict[str, Any]]] = {"strategy": [], "owner_mirror": []}
         for item in entries[-limit:]:
-            result[item.domain].append(
+            result[str(item.domain)].append(
                 {
                     "entry_id": str(db0.uuid(item)),
-                    "kind": item.kind,
-                    "amount_usd": item.amount_usd,
+                    "kind": str(item.kind),
+                    "amount_usd": str(item.amount_usd),
                     "intent_id": str(db0.uuid(item.intent)) if item.intent is not None else None,
-                    "occurred_at": item.occurred_at,
+                    "occurred_at": item.occurred_at.isoformat(),
                 }
             )
         return {"currency": "USD", "series": result, "complete": False, "gaps": ["pre-activation history unavailable"]}

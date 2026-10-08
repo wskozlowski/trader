@@ -56,8 +56,8 @@ class ControlScopeVerifier:
                             subject_id=str(record.subject_id),
                             trading_account_id=str(record.trading_account_id),
                             trading_portfolio_id=str(record.trading_portfolio_id),
-                            issued_at=datetime.fromisoformat(record.issued_at),
-                            expires_at=(None if not record.expires_at else datetime.fromisoformat(record.expires_at)),
+                            issued_at=record.issued_at,
+                            expires_at=record.expires_at,
                             revoked=bool(record.revoked),
                             source=str(record.source),
                         )

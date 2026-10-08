@@ -459,6 +459,99 @@ not blindly retry it. Strategy fills and owner-copy fills are independent facts.
 Direct REST calls are outside `TraderService` persistence and ownership. A production direct-demo
 CLI should add its own durable request, lookup, and audit records before it is used unattended.
 
+## Native local UI API
+
+`trader_api.ui_api` provides typed Python results for an already selected local trader.
+It has no web framework dependency or UI authentication layer. Construct the existing
+`TraderService` using its normal verified broker configuration, select its trader prefix,
+then bind one application session:
+
+```python
+from trader_api.ui_api import (
+    Period, get_dashboard, get_operation, get_statistics, list_operations,
+    open_session, request_refresh, start_refresh, stop_refresh,
+)
+
+service.store.open(service.prefix)  # Select once at the application boundary.
+session = open_session(service)
+start_refresh(session)
+try:
+    dashboard = get_dashboard(session)
+    statistics = get_statistics(session, Period.WEEK)
+    page = list_operations(session, limit=100)
+    if page.items:
+        detail = get_operation(session, page.items[0].intent)
+    if page.next_cursor is not None:
+        next_page = list_operations(session, cursor=page.next_cursor)
+    request_refresh(session)  # Coalesced; returns status without waiting for the broker.
+finally:
+    stop_refresh(session)  # Join the collector before closing dbzero.
+```
+
+Every subsequent function receives the captured session, never a prefix. Ambient prefix
+changes do not redirect it. Cross-prefix entity handles and cursors from another session
+or query are rejected. Close and reopen the session after restarting dbzero; obtain new
+Python handles from the persisted records. Results contain native `Decimal`, aware UTC
+`datetime`, enums and memo entity handles. Their collections are detached; use handles
+only to identify entities, not as mutable result data. There are no generated UUID links.
+
+`get_dashboard` reads lifecycle, policy budgets, owner allocation, strategy valuation,
+current operation counts and refresh status. Owner allocation and the owner risk budget
+are not owner equity and are never included in strategy equity. Missing broker metrics
+are `None`, with completeness reasons. The eToro reader recognizes explicit USD `equity`,
+`cash`/`availableCash`/`credit`, `unrealizedPnl`/`unrealizedPnL` and `exposure` fields in the
+flat identity-bearing response or `clientPortfolio` envelope. Credit alone does not imply
+equity. Unknown shapes or responses with no recognized metrics report `VALUATION_UNAVAILABLE`.
+Custom brokers can implement the `PortfolioReader` protocol in `broker.observations`.
+
+`get_statistics` selects UTC today, Monday week-to-date, month-to-date or collection
+lifetime (`Period.TODAY`, `WEEK`, `MONTH`, `ALL`). Summaries are persisted during updates.
+Reads never scan historical observations or create a new period. Before the next update
+after rollover, that period reports `period_not_collected`. Confirmed costs and realized
+P&L come from cumulative per-operation broker reports, with only changes from the prior
+checkpoint applied. A correction is recognized in the period when it is received, without
+rewriting closed periods. Estimates and opening-notional ledger entries never enter
+confirmed P&L. Missing reports remain explicit, including when only part of a total is known.
+Operation-state counts are the last persisted current-state distribution, not a count of
+transitions. Equity change and absolute maximum drawdown describe sampled strategy equity;
+they are not cash-flow-adjusted returns. Unknown intervals and mid-period collection starts
+make periods incomplete. There is no historical backfill or old-schema migration workflow.
+
+`list_operations`, `list_positions`, `list_orders`, `list_audit_events`, and
+`list_accounting_observations` use indexed filters and ascending sequence pagination.
+Default size is 100; the maximum is 1,000. An operation detail contains first pages of its
+related records; continue through the corresponding list function using the same intent
+filter. A cursor fixes the append ceiling so concurrent inserts do not grow an ongoing
+scan. State filters use the state at each page read: records that change state may enter
+or leave the remaining pages. Audit filters include kind, actor, source, intent and time;
+all time ranges are start-inclusive and end-exclusive. Audit hashes and source facts are
+unchanged by the UI API.
+
+`get_portfolio_chart(session, start, end, resolution=None)` reads stored minute, hour or
+day buckets in UTC time order. Automatic resolution picks the finest range that fits
+1,000 buckets; longer-than-daily-cap ranges are rejected rather than truncated. Boundary
+buckets contain the whole stored interval, and absent buckets remain gaps. Each bucket
+contains first/last/minimum/maximum equity, latest supported components, sample count
+and completeness. Neither chart nor statistics reads regroup source history.
+
+Refresh starts immediately, then runs every 60 seconds. Importing the package starts no
+threads. At most one collector owns a trader prefix in the process; repeated starts are
+idempotent for its session. Manual requests during an in-flight collection are satisfied
+by that collection; queued requests respect backoff. `get_refresh_status` reports running,
+refreshing and queued states, attempt/success times, next attempt, sanitized error,
+generation and staleness (no success for over 120 seconds). Failures preserve last-good
+data and retry after 60, 120, 240, then 300 seconds, or later when `Retry-After` requires it.
+Persisted retry deadlines survive restart; interrupted attempts never become successes.
+The worker rechecks the retained credential evidence and portfolio binding before and
+after network collection. Refresh never dispatches trades or runs trading reconciliation.
+
+Application database transactions, execution projections and UI updates share a lock;
+network collection runs outside it. Source observations, checkpoints and affected
+summaries/buckets commit atomically. Direct application mutations of memo objects should
+use `service.store.transaction(service.prefix)` and the write-side update hooks; bypassing
+those hooks cannot maintain the UI statistics. Public function docstrings specify all
+arguments, ordering, freshness, scope, side effects and error behavior.
+
 ## Common errors
 
 | Code | Meaning |

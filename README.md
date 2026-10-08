@@ -55,8 +55,17 @@ Tests may use child directories beneath the demo root. No dotenv, environment va
 can redirect the real root.
 
 Persistent models use plain names (`Intent`, `Preview`, etc.) and store related memo objects
-directly. Models use dataclass constructors without prefix arguments; storage operations
+directly. `Trader` owns the immutable name in its trader prefix; `TraderState`,
+`PortfolioBinding`, and the control-side `TraderRegistration` reference that instance.
+String trader names are resolved during registration/authentication and retained in API values.
+Models use dataclass constructors without prefix arguments; storage operations
 select the active prefix with `db0.open` before constructing objects, including singletons.
+Monetary amounts, position units, and protection rates are stored as `Decimal` values;
+JSON/API output serializes them as strings.
+Parameters and audit facts use native dictionaries, and broker outcomes retain native
+numeric values. Timestamps use timezone-aware `datetime` values; audit hashing uses UTC
+at dbzero's millisecond precision. Operations, lifecycle states, execution states, sides,
+and ledger categories use dbzero enums. Absent optional values use `None`.
 UUIDs are serialized only for API responses and exports; incoming API IDs are
 resolved to instances with type and trader-prefix checks. Internal links, comparisons, and
 relationship queries use instances, with no UUID lookup tags. `tag_fields` indexes relationships and broker IDs,

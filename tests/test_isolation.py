@@ -67,6 +67,11 @@ def test_two_traders_with_overlapping_symbols_are_physically_isolated(
     )
     alpha.initialize("2000")
     beta.initialize("2000")
+    assert alpha.trader != beta.trader
+    assert alpha.store is not None and alpha.prefix is not None and beta.trader is not None
+    with pytest.raises(TraderError) as foreign_state:
+        alpha.store.state(alpha.prefix, beta.trader)
+    assert foreign_state.value.code == "TRADER_MISMATCH"
     alpha_preview = alpha.preview_open(symbol="AAPL", side="long", strategy_notional_usd="100")
     alpha_intent = alpha.submit(alpha_preview["preview_id"], "shared-looking-key")
     assert beta.positions() == []
