@@ -4,7 +4,9 @@ import hashlib
 import json
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import InitVar, dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -16,8 +18,37 @@ from .errors import TraderError
 T = TypeVar("T")
 
 
+def _prefix_init[T](model: type[T]) -> type[T]:
+    """Set the memo prefix before the generated dataclass initializer writes fields."""
+    initialize = cast(Callable[..., None], model.__init__)
+
+    @wraps(initialize)
+    def initialize_in_prefix(self: T, prefix: str, *args: Any, **kwargs: Any) -> None:
+        db0.set_prefix(self, prefix)
+        initialize(self, prefix, *args, **kwargs)
+
+    cast(Any, model).__init__ = initialize_in_prefix
+    return model
+
+
+# Dbzero discovers singleton prefixes from the leading set_prefix call in __init__.
+# Keep these constructors explicit; ordinary memos use generated dataclass initializers.
 @db0.memo(singleton=True)
 class TraderState:
+    trader_id: str
+    environment: str
+    initialized: bool
+    currency: str
+    strategy_initial_cap: str
+    owner_initial_cap: str
+    strategy_realized: str
+    owner_realized: str
+    strategy_committed: str
+    owner_committed: str
+    policy_version: int
+    audit_sequence: int
+    audit_head: str
+
     def __init__(self, prefix: str, trader_id: str, environment: str) -> None:
         db0.set_prefix(self, prefix)
         self.trader_id = trader_id
@@ -37,6 +68,23 @@ class TraderState:
 
 @db0.memo(singleton=True)
 class PortfolioBinding:
+    environment: str
+    trader_id: str
+    owner_account_id: str
+    agent_portfolio_id: str
+    agent_portfolio_gcid: str
+    agent_trading_account_id: str
+    agent_trading_portfolio_id: str
+    mirror_id: str
+    investment_usd: str
+    virtual_balance_usd: str
+    lifecycle: str
+    binding_version: int
+    copy_healthy: bool
+    credential_fingerprint: str
+    scope_names: list[str]
+    verified_at: str
+
     def __init__(self, prefix: str) -> None:
         db0.set_prefix(self, prefix)
         self.environment = ""
@@ -58,282 +106,189 @@ class PortfolioBinding:
 
 
 @db0.memo
+@_prefix_init
+@dataclass(eq=False)
 class Preview:
-    def __init__(
-        self,
-        prefix: str,
-        operation: str,
-        params_json: str,
-        created_at: str,
-        expires_at: str,
-        state_fingerprint: str,
-        binding_version: int,
-        policy_version: int,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.operation = operation
-        self.params_json = params_json
-        self.created_at = created_at
-        self.expires_at = expires_at
-        self.state_fingerprint = state_fingerprint
-        self.binding_version = binding_version
-        self.policy_version = policy_version
+    prefix: InitVar[str]
+    operation: str
+    params_json: str
+    created_at: str
+    expires_at: str
+    state_fingerprint: str
+    binding_version: int
+    policy_version: int
 
 
 @db0.memo
 @db0.tag_fields("preview", "request_id")
+@_prefix_init
+@dataclass(eq=False)
 class Intent:
-    def __init__(
-        self,
-        prefix: str,
-        preview: Preview,
-        idempotency_key: str,
-        operation: str,
-        params_json: str,
-        request_id: str,
-        command_digest: str,
-        binding_version: int,
-        policy_version: int,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.preview = preview
-        self.idempotency_key = idempotency_key
-        self.operation = operation
-        self.params_json = params_json
-        self.request_id = request_id
-        self.command_digest = command_digest
-        self.binding_version = binding_version
-        self.policy_version = policy_version
-        self.state = IntentState.COMMITTED.value
-        self.created_at = utc_now().isoformat()
-        self.broker_order_id = ""
-        self.broker_position_id = ""
-        self.error_code = ""
+    prefix: InitVar[str]
+    preview: Preview
+    idempotency_key: str
+    operation: str
+    params_json: str
+    request_id: str
+    command_digest: str
+    binding_version: int
+    policy_version: int
+    state: str = field(default=IntentState.COMMITTED.value, kw_only=True)
+    created_at: str = field(default_factory=lambda: utc_now().isoformat(), kw_only=True)
+    broker_order_id: str = field(default="", kw_only=True)
+    broker_position_id: str = field(default="", kw_only=True)
+    error_code: str = field(default="", kw_only=True)
 
 
 @db0.memo
 @db0.tag_fields("intent")
+@_prefix_init
+@dataclass(eq=False)
 class Reservation:
-    def __init__(
-        self,
-        prefix: str,
-        intent: Intent,
-        strategy_amount_usd: str,
-        owner_amount_usd: str,
-        binding_version: int,
-        policy_version: int,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.intent = intent
-        self.strategy_amount_usd = strategy_amount_usd
-        self.owner_amount_usd = owner_amount_usd
-        self.binding_version = binding_version
-        self.policy_version = policy_version
-        self.state = "HELD"
+    prefix: InitVar[str]
+    intent: Intent
+    strategy_amount_usd: str
+    owner_amount_usd: str
+    binding_version: int
+    policy_version: int
+    state: str = field(default="HELD", kw_only=True)
 
 
 @db0.memo
 @db0.tag_fields("intent", "position_id")
+@_prefix_init
+@dataclass(eq=False)
 class Position:
-    def __init__(
-        self,
-        prefix: str,
-        position_id: str,
-        intent: Intent,
-        symbol: str,
-        side: str,
-        instrument_id: int,
-        leverage: int,
-        strategy_notional_usd: str,
-        units: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.position_id = position_id
-        self.intent = intent
-        self.symbol = symbol
-        self.side = side
-        self.instrument_id = instrument_id
-        self.leverage = leverage
-        self.strategy_notional_usd = strategy_notional_usd
-        self.units = units
-        self.stop_loss_rate = ""
-        self.take_profit_rate = ""
-        self.state = "OPEN"
+    prefix: InitVar[str]
+    position_id: str
+    intent: Intent
+    symbol: str
+    side: str
+    instrument_id: int
+    leverage: int
+    strategy_notional_usd: str
+    units: str
+    stop_loss_rate: str = field(default="", kw_only=True)
+    take_profit_rate: str = field(default="", kw_only=True)
+    state: str = field(default="OPEN", kw_only=True)
 
 
 @db0.memo
 @db0.tag_fields("intent", "order_id")
+@_prefix_init
+@dataclass(eq=False)
 class Order:
-    def __init__(
-        self,
-        prefix: str,
-        order_id: str,
-        intent: Intent,
-        symbol: str,
-        state: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.order_id = order_id
-        self.intent = intent
-        self.symbol = symbol
-        self.state = state
+    prefix: InitVar[str]
+    order_id: str
+    intent: Intent
+    symbol: str
+    state: str
 
 
 @db0.memo(immutable=True)
 @db0.tag_fields("intent", "kind")
+@_prefix_init
+@dataclass(eq=False)
 class AuditEvent:
-    def __init__(
-        self,
-        prefix: str,
-        sequence: int,
-        occurred_at: str,
-        kind: str,
-        actor: str,
-        intent: Intent | None,
-        source: str,
-        facts_json: str,
-        previous_hash: str,
-        event_hash: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.sequence = sequence
-        self.occurred_at = occurred_at
-        self.kind = kind
-        self.actor = actor
-        self.intent = intent
-        self.source = source
-        self.facts_json = facts_json
-        self.previous_hash = previous_hash
-        self.event_hash = event_hash
+    prefix: InitVar[str]
+    sequence: int
+    occurred_at: str
+    kind: str
+    actor: str
+    intent: Intent | None
+    source: str
+    facts_json: str
+    previous_hash: str
+    event_hash: str
 
 
 @db0.memo(immutable=True)
 @db0.tag_fields("intent", "domain")
+@_prefix_init
+@dataclass(eq=False)
 class LedgerEntry:
-    def __init__(
-        self,
-        prefix: str,
-        domain: str,
-        kind: str,
-        amount_usd: str,
-        intent: Intent | None,
-        occurred_at: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.domain = domain
-        self.kind = kind
-        self.amount_usd = amount_usd
-        self.intent = intent
-        self.occurred_at = occurred_at
+    prefix: InitVar[str]
+    domain: str
+    kind: str
+    amount_usd: str
+    intent: Intent | None
+    occurred_at: str
 
 
 @db0.memo
+@_prefix_init
+@dataclass(eq=False)
 class TraderRegistration:
-    def __init__(
-        self,
-        prefix: str,
-        trader_hash: str,
-        trader_id: str,
-        storage_key: str,
-        service_credential_hash: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.trader_hash = trader_hash
-        self.trader_id = trader_id
-        self.storage_key = storage_key
-        self.service_credential_hash = service_credential_hash
-        self.authorized = True
+    prefix: InitVar[str]
+    trader_hash: str
+    trader_id: str
+    storage_key: str
+    service_credential_hash: str
+    authorized: bool = field(default=True, kw_only=True)
 
 
 @db0.memo
+@_prefix_init
+@dataclass(eq=False)
 class ControlReservation:
-    def __init__(
-        self,
-        prefix: str,
-        command_digest: str,
-        storage_key: str,
-        request_id: str,
-        binding_version: int,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.command_digest = command_digest
-        self.storage_key = storage_key
-        self.request_id = request_id
-        self.binding_version = binding_version
-        self.state = "RESERVED"
-        self.outcome_json = ""
+    prefix: InitVar[str]
+    command_digest: str
+    storage_key: str
+    request_id: str
+    binding_version: int
+    state: str = field(default="RESERVED", kw_only=True)
+    outcome_json: str = field(default="", kw_only=True)
 
 
 @db0.memo
+@_prefix_init
+@dataclass(eq=False)
 class ProvisioningIntent:
-    def __init__(
-        self,
-        prefix: str,
-        request_key_digest: str,
-        request_id: str,
-        trader_hash: str,
-        portfolio_name: str,
-        investment_usd: str,
-        scopes: list[str],
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.request_key_digest = request_key_digest
-        self.request_id = request_id
-        self.trader_hash = trader_hash
-        self.portfolio_name = portfolio_name
-        self.investment_usd = investment_usd
-        self.scopes = scopes
-        self.state = "COMMITTED"
-        self.agent_portfolio_id = ""
-        self.credential_reference = ""
-        self.error_code = ""
+    prefix: InitVar[str]
+    request_key_digest: str
+    request_id: str
+    trader_hash: str
+    portfolio_name: str
+    investment_usd: str
+    scopes: list[str]
+    state: str = field(default="COMMITTED", kw_only=True)
+    agent_portfolio_id: str = field(default="", kw_only=True)
+    credential_reference: str = field(default="", kw_only=True)
+    error_code: str = field(default="", kw_only=True)
 
 
 @db0.memo(immutable=True)
+@_prefix_init
+@dataclass(eq=False)
 class OwnershipClaim:
-    def __init__(
-        self,
-        prefix: str,
-        scoped_key_digest: str,
-        storage_key: str,
-        entity_type: str,
-        broker_id: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.scoped_key_digest = scoped_key_digest
-        self.storage_key = storage_key
-        self.entity_type = entity_type
-        self.broker_id = broker_id
+    prefix: InitVar[str]
+    scoped_key_digest: str
+    storage_key: str
+    entity_type: str
+    broker_id: str
 
 
 @db0.memo
+@_prefix_init
+@dataclass(eq=False)
 class TokenVerification:
-    def __init__(
-        self,
-        prefix: str,
-        credential_fingerprint: str,
-        scopes: list[str],
-        subject_id: str,
-        trading_account_id: str,
-        trading_portfolio_id: str,
-        issued_at: str,
-        expires_at: str,
-        source: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.credential_fingerprint = credential_fingerprint
-        self.scopes = scopes
-        self.subject_id = subject_id
-        self.trading_account_id = trading_account_id
-        self.trading_portfolio_id = trading_portfolio_id
-        self.issued_at = issued_at
-        self.expires_at = expires_at
-        self.source = source
-        self.revoked = False
+    prefix: InitVar[str]
+    credential_fingerprint: str
+    scopes: list[str]
+    subject_id: str
+    trading_account_id: str
+    trading_portfolio_id: str
+    issued_at: str
+    expires_at: str
+    source: str
+    revoked: bool = field(default=False, kw_only=True)
 
 
 @db0.memo(singleton=True)
 class ControlState:
+    audit_sequence: int
+    audit_head: str
+
     def __init__(self, prefix: str) -> None:
         db0.set_prefix(self, prefix)
         self.audit_sequence = 0
@@ -341,24 +296,16 @@ class ControlState:
 
 
 @db0.memo(immutable=True)
+@_prefix_init
+@dataclass(eq=False)
 class ControlEvent:
-    def __init__(
-        self,
-        prefix: str,
-        sequence: int,
-        occurred_at: str,
-        kind: str,
-        facts_json: str,
-        previous_hash: str,
-        event_hash: str,
-    ) -> None:
-        db0.set_prefix(self, prefix)
-        self.sequence = sequence
-        self.occurred_at = occurred_at
-        self.kind = kind
-        self.facts_json = facts_json
-        self.previous_hash = previous_hash
-        self.event_hash = event_hash
+    prefix: InitVar[str]
+    sequence: int
+    occurred_at: str
+    kind: str
+    facts_json: str
+    previous_hash: str
+    event_hash: str
 
 
 _runtime_lock = threading.RLock()
