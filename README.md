@@ -55,7 +55,9 @@ Tests may use child directories beneath the demo root. No dotenv, environment va
 can redirect the real root.
 
 Persistent models use plain names (`Intent`, `Preview`, etc.) and store related memo objects
-directly. UUIDs are serialized only for API responses and exports; incoming API IDs are
+directly. Models use dataclass constructors without prefix arguments; storage operations
+select the active prefix with `db0.open` before constructing objects, including singletons.
+UUIDs are serialized only for API responses and exports; incoming API IDs are
 resolved to instances with type and trader-prefix checks. Internal links, comparisons, and
 relationship queries use instances, with no UUID lookup tags. `tag_fields` indexes relationships and broker IDs,
 with object-tag queries using `db0.as_tag(instance)`. Broker/request IDs and opaque trader

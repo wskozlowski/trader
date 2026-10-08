@@ -4,9 +4,8 @@ import hashlib
 import json
 import threading
 import uuid
-from collections.abc import Callable, Iterable
-from dataclasses import InitVar, dataclass, field
-from functools import wraps
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -18,98 +17,48 @@ from .errors import TraderError
 T = TypeVar("T")
 
 
-def _prefix_init[T](model: type[T]) -> type[T]:
-    """Set the memo prefix before the generated dataclass initializer writes fields."""
-    initialize = cast(Callable[..., None], model.__init__)
-
-    @wraps(initialize)
-    def initialize_in_prefix(self: T, prefix: str, *args: Any, **kwargs: Any) -> None:
-        db0.set_prefix(self, prefix)
-        initialize(self, prefix, *args, **kwargs)
-
-    cast(Any, model).__init__ = initialize_in_prefix
-    return model
-
-
-# Dbzero discovers singleton prefixes from the leading set_prefix call in __init__.
-# Keep these constructors explicit; ordinary memos use generated dataclass initializers.
 @db0.memo(singleton=True)
+@dataclass(eq=False)
 class TraderState:
     trader_id: str
     environment: str
-    initialized: bool
-    currency: str
-    strategy_initial_cap: str
-    owner_initial_cap: str
-    strategy_realized: str
-    owner_realized: str
-    strategy_committed: str
-    owner_committed: str
-    policy_version: int
-    audit_sequence: int
-    audit_head: str
-
-    def __init__(self, prefix: str, trader_id: str, environment: str) -> None:
-        db0.set_prefix(self, prefix)
-        self.trader_id = trader_id
-        self.environment = environment
-        self.initialized = False
-        self.currency = "USD"
-        self.strategy_initial_cap = "0.00"
-        self.owner_initial_cap = "0.00"
-        self.strategy_realized = "0.00"
-        self.owner_realized = "0.00"
-        self.strategy_committed = "0.00"
-        self.owner_committed = "0.00"
-        self.policy_version = 1
-        self.audit_sequence = 0
-        self.audit_head = "0" * 64
+    initialized: bool = field(default=False, kw_only=True)
+    currency: str = field(default="USD", kw_only=True)
+    strategy_initial_cap: str = field(default="0.00", kw_only=True)
+    owner_initial_cap: str = field(default="0.00", kw_only=True)
+    strategy_realized: str = field(default="0.00", kw_only=True)
+    owner_realized: str = field(default="0.00", kw_only=True)
+    strategy_committed: str = field(default="0.00", kw_only=True)
+    owner_committed: str = field(default="0.00", kw_only=True)
+    policy_version: int = field(default=1, kw_only=True)
+    audit_sequence: int = field(default=0, kw_only=True)
+    audit_head: str = field(default="0" * 64, kw_only=True)
 
 
 @db0.memo(singleton=True)
+@dataclass(eq=False)
 class PortfolioBinding:
-    environment: str
-    trader_id: str
-    owner_account_id: str
-    agent_portfolio_id: str
-    agent_portfolio_gcid: str
-    agent_trading_account_id: str
-    agent_trading_portfolio_id: str
-    mirror_id: str
-    investment_usd: str
-    virtual_balance_usd: str
-    lifecycle: str
-    binding_version: int
-    copy_healthy: bool
-    credential_fingerprint: str
-    scope_names: list[str]
-    verified_at: str
-
-    def __init__(self, prefix: str) -> None:
-        db0.set_prefix(self, prefix)
-        self.environment = ""
-        self.trader_id = ""
-        self.owner_account_id = ""
-        self.agent_portfolio_id = ""
-        self.agent_portfolio_gcid = ""
-        self.agent_trading_account_id = ""
-        self.agent_trading_portfolio_id = ""
-        self.mirror_id = ""
-        self.investment_usd = "0.00"
-        self.virtual_balance_usd = "0.00"
-        self.lifecycle = Lifecycle.UNBOUND.value
-        self.binding_version = 0
-        self.copy_healthy = False
-        self.credential_fingerprint = ""
-        self.scope_names: list[str] = []
-        self.verified_at = ""
+    environment: str = field(default="", kw_only=True)
+    trader_id: str = field(default="", kw_only=True)
+    owner_account_id: str = field(default="", kw_only=True)
+    agent_portfolio_id: str = field(default="", kw_only=True)
+    agent_portfolio_gcid: str = field(default="", kw_only=True)
+    agent_trading_account_id: str = field(default="", kw_only=True)
+    agent_trading_portfolio_id: str = field(default="", kw_only=True)
+    mirror_id: str = field(default="", kw_only=True)
+    investment_usd: str = field(default="0.00", kw_only=True)
+    virtual_balance_usd: str = field(default="0.00", kw_only=True)
+    lifecycle: str = field(default=Lifecycle.UNBOUND.value, kw_only=True)
+    binding_version: int = field(default=0, kw_only=True)
+    copy_healthy: bool = field(default=False, kw_only=True)
+    credential_fingerprint: str = field(default="", kw_only=True)
+    scope_names: list[str] = field(default_factory=list, kw_only=True)
+    verified_at: str = field(default="", kw_only=True)
 
 
 @db0.memo
-@_prefix_init
 @dataclass(eq=False)
 class Preview:
-    prefix: InitVar[str]
     operation: str
     params_json: str
     created_at: str
@@ -121,10 +70,8 @@ class Preview:
 
 @db0.memo
 @db0.tag_fields("preview", "request_id")
-@_prefix_init
 @dataclass(eq=False)
 class Intent:
-    prefix: InitVar[str]
     preview: Preview
     idempotency_key: str
     operation: str
@@ -142,10 +89,8 @@ class Intent:
 
 @db0.memo
 @db0.tag_fields("intent")
-@_prefix_init
 @dataclass(eq=False)
 class Reservation:
-    prefix: InitVar[str]
     intent: Intent
     strategy_amount_usd: str
     owner_amount_usd: str
@@ -156,10 +101,8 @@ class Reservation:
 
 @db0.memo
 @db0.tag_fields("intent", "position_id")
-@_prefix_init
 @dataclass(eq=False)
 class Position:
-    prefix: InitVar[str]
     position_id: str
     intent: Intent
     symbol: str
@@ -175,10 +118,8 @@ class Position:
 
 @db0.memo
 @db0.tag_fields("intent", "order_id")
-@_prefix_init
 @dataclass(eq=False)
 class Order:
-    prefix: InitVar[str]
     order_id: str
     intent: Intent
     symbol: str
@@ -187,10 +128,8 @@ class Order:
 
 @db0.memo(immutable=True)
 @db0.tag_fields("intent", "kind")
-@_prefix_init
 @dataclass(eq=False)
 class AuditEvent:
-    prefix: InitVar[str]
     sequence: int
     occurred_at: str
     kind: str
@@ -204,10 +143,8 @@ class AuditEvent:
 
 @db0.memo(immutable=True)
 @db0.tag_fields("intent", "domain")
-@_prefix_init
 @dataclass(eq=False)
 class LedgerEntry:
-    prefix: InitVar[str]
     domain: str
     kind: str
     amount_usd: str
@@ -216,10 +153,8 @@ class LedgerEntry:
 
 
 @db0.memo
-@_prefix_init
 @dataclass(eq=False)
 class TraderRegistration:
-    prefix: InitVar[str]
     trader_hash: str
     trader_id: str
     storage_key: str
@@ -228,10 +163,8 @@ class TraderRegistration:
 
 
 @db0.memo
-@_prefix_init
 @dataclass(eq=False)
 class ControlReservation:
-    prefix: InitVar[str]
     command_digest: str
     storage_key: str
     request_id: str
@@ -241,10 +174,8 @@ class ControlReservation:
 
 
 @db0.memo
-@_prefix_init
 @dataclass(eq=False)
 class ProvisioningIntent:
-    prefix: InitVar[str]
     request_key_digest: str
     request_id: str
     trader_hash: str
@@ -258,10 +189,8 @@ class ProvisioningIntent:
 
 
 @db0.memo(immutable=True)
-@_prefix_init
 @dataclass(eq=False)
 class OwnershipClaim:
-    prefix: InitVar[str]
     scoped_key_digest: str
     storage_key: str
     entity_type: str
@@ -269,10 +198,8 @@ class OwnershipClaim:
 
 
 @db0.memo
-@_prefix_init
 @dataclass(eq=False)
 class TokenVerification:
-    prefix: InitVar[str]
     credential_fingerprint: str
     scopes: list[str]
     subject_id: str
@@ -285,21 +212,15 @@ class TokenVerification:
 
 
 @db0.memo(singleton=True)
+@dataclass(eq=False)
 class ControlState:
-    audit_sequence: int
-    audit_head: str
-
-    def __init__(self, prefix: str) -> None:
-        db0.set_prefix(self, prefix)
-        self.audit_sequence = 0
-        self.audit_head = "0" * 64
+    audit_sequence: int = field(default=0, kw_only=True)
+    audit_head: str = field(default="0" * 64, kw_only=True)
 
 
 @db0.memo(immutable=True)
-@_prefix_init
 @dataclass(eq=False)
 class ControlEvent:
-    prefix: InitVar[str]
     sequence: int
     occurred_at: str
     kind: str
@@ -345,17 +266,15 @@ class DbzeroStore:
                 _runtime_root = resolved
             elif _runtime_root != resolved:
                 raise TraderError("STORAGE_INVALID", "a process cannot open two dbzero physical roots")
-            self._open(self.control_prefix)
+            self.open(self.control_prefix)
 
     @staticmethod
     def trader_hash(trader_id: str) -> str:
         return hashlib.sha256(trader_id.encode()).hexdigest()
 
-    def _open(self, prefix: str, mode: str = "rw") -> None:
-        opened = {item.name for item in db0.get_prefixes()}
-        mutable = {item.name for item in db0.get_mutable_prefixes()}
-        if prefix not in opened or (mode == "rw" and prefix not in mutable):
-            db0.open(prefix, mode, autocommit=False, restricted=True)
+    def open(self, prefix: str, mode: str = "rw") -> None:
+        """Select the active prefix, including when it is already open."""
+        db0.open(prefix, mode, autocommit=False, restricted=True)
 
     def register(self, trader_id: str, service_credential: str) -> str:
         trader_hash = self.trader_hash(trader_id)
@@ -366,7 +285,7 @@ class DbzeroStore:
                 raise TraderError("TRADER_MISMATCH", "trader registration does not match credentials")
             return str(existing.storage_key)
         storage_key = str(uuid.uuid4())
-        item = TraderRegistration(self.control_prefix, trader_hash, trader_id, storage_key, credential_hash)
+        item = TraderRegistration(trader_hash, trader_id, storage_key, credential_hash)
         db0.tags(item).add([f"trader:{trader_hash}", f"storage:{storage_key}"])
         self.append_control_event("TRADER_REGISTERED", {"trader_hash": trader_hash})
         db0.commit(self.control_prefix)
@@ -390,16 +309,16 @@ class DbzeroStore:
         except ValueError as exc:
             raise TraderError("STORAGE_INVALID", "invalid opaque trader storage key") from exc
         prefix = f"/trader/{self.environment.value}/traders/{normalized}"
-        self._open(prefix)
+        self.open(prefix)
         return prefix
 
     def one(self, model: type[T], tag: Any = None, *, prefix: str) -> T | None:
-        self._open(prefix)
+        self.open(prefix)
         query = db0.find(model, *([tag] if tag is not None else []), prefix=prefix)
         return cast(T | None, next(iter(query), None))
 
     def all(self, model: type[T], *tags: Any, prefix: str) -> list[T]:
-        self._open(prefix)
+        self.open(prefix)
         return cast(list[T], list(db0.find(model, *tags, prefix=prefix)))
 
     def tag(self, item: Any, *tags: str) -> None:
@@ -409,12 +328,12 @@ class DbzeroStore:
         db0.commit(prefix)
 
     def state(self, prefix: str, trader_id: str) -> TraderState:
-        self._open(prefix)
-        return TraderState(prefix, trader_id, self.environment.value)
+        self.open(prefix)
+        return TraderState(trader_id, self.environment.value)
 
     def binding(self, prefix: str) -> PortfolioBinding:
-        self._open(prefix)
-        return PortfolioBinding(prefix)
+        self.open(prefix)
+        return PortfolioBinding()
 
     def append_audit(
         self,
@@ -427,6 +346,7 @@ class DbzeroStore:
         source: str = "trader",
         facts: dict[str, Any] | None = None,
     ) -> AuditEvent:
+        self.open(prefix)
         safe_facts = json.dumps(facts or {}, sort_keys=True, separators=(",", ":"))
         sequence = int(state.audit_sequence) + 1
         occurred_at = utc_now().isoformat()
@@ -437,7 +357,6 @@ class DbzeroStore:
         )
         event_hash = hashlib.sha256(body.encode()).hexdigest()
         event = AuditEvent(
-            prefix,
             sequence,
             occurred_at,
             kind,
@@ -500,7 +419,7 @@ class DbzeroStore:
         existing = self.one(ControlReservation, f"command:{command_digest}", prefix=self.control_prefix)
         if existing is not None:
             return existing
-        reservation = ControlReservation(self.control_prefix, command_digest, storage_key, request_id, binding_version)
+        reservation = ControlReservation(command_digest, storage_key, request_id, binding_version)
         self.tag(reservation, f"command:{command_digest}", f"storage:{storage_key}", "CONTROL_RESERVATION")
         self.append_control_event(
             "CONTROL_RESERVATION_COMMITTED",
@@ -529,7 +448,7 @@ class DbzeroStore:
             if existing.storage_key != storage_key:
                 raise TraderError("BROKER_CAPACITY_UNAVAILABLE", "broker entity is already claimed")
             return
-        claim = OwnershipClaim(self.control_prefix, digest, storage_key, entity_type, broker_id)
+        claim = OwnershipClaim(digest, storage_key, entity_type, broker_id)
         self.tag(claim, f"ownership:{digest}", f"storage:{storage_key}", "OWNERSHIP")
         self.append_control_event("OWNERSHIP_CLAIMED", {"scoped_key_digest": digest, "entity_type": entity_type})
 
@@ -553,7 +472,6 @@ class DbzeroStore:
             existing.revoked = bool(evidence.revoked)
         else:
             existing = TokenVerification(
-                self.control_prefix,
                 credential_fingerprint,
                 sorted(evidence.scopes),
                 evidence.subject_id,
@@ -578,14 +496,14 @@ class DbzeroStore:
         )
 
     def append_control_event(self, kind: str, facts: dict[str, Any]) -> ControlEvent:
-        state = ControlState(self.control_prefix)
+        self.open(self.control_prefix)
+        state = ControlState()
         sequence = int(state.audit_sequence) + 1
         occurred_at = utc_now().isoformat()
         facts_json = json.dumps(facts, sort_keys=True, separators=(",", ":"))
         body = json.dumps([sequence, occurred_at, kind, facts_json, state.audit_head], separators=(",", ":"))
         event_hash = hashlib.sha256(body.encode()).hexdigest()
         event = ControlEvent(
-            self.control_prefix,
             sequence,
             occurred_at,
             kind,
@@ -599,7 +517,8 @@ class DbzeroStore:
         return event
 
     def verify_control_audit(self) -> dict[str, Any]:
-        state = ControlState(self.control_prefix)
+        self.open(self.control_prefix)
+        state = ControlState()
         events = sorted(
             self.all(ControlEvent, "CONTROL_AUDIT", prefix=self.control_prefix),
             key=lambda item: item.sequence,

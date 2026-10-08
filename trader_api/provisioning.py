@@ -101,8 +101,8 @@ class OwnerAdminService:
             else frozenset({REAL_READ, REAL_WRITE})
         )
         request_id = str(uuid.uuid4())
+        self.store.open(self.store.control_prefix)
         intent = ProvisioningIntent(
-            self.store.control_prefix,
             key_digest,
             request_id,
             self.store.trader_hash(trader_id),
@@ -315,8 +315,8 @@ class OwnerAdminService:
         state.owner_realized = str(realized)
         state.owner_committed = str(committed)
         binding.copy_healthy = bool(copy_healthy)
+        self.store.open(prefix)
         entry = LedgerEntry(
-            prefix,
             "owner_mirror",
             "RECONCILED_ACTUAL",
             str(realized),

@@ -54,6 +54,9 @@ def test_lifecycle_persists_preview_intent_and_audit(runtime: dict[str, object])
         linked = store.all(model, db0.as_tag(intent), prefix=prefix)
         assert linked, model
         assert all(item.intent == intent for item in linked)
+        assert all(db0.get_prefix_of(item).name == prefix.lstrip("/") for item in linked)
+        assert store.all(model, prefix=store.control_prefix) == []
+    assert store.verify_control_audit()["valid"] is True
     assert any(event["intent_id"] == result["intent_id"] for event in restarted.audit_events())
     assert restarted.portfolio_history()["series"]["strategy"][0]["intent_id"] == result["intent_id"]
 

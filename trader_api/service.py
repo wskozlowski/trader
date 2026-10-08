@@ -277,8 +277,8 @@ class TraderService:
         assert self.store is not None and self.prefix is not None
         created = self._clock()
         expires = created + timedelta(minutes=5)
+        self.store.open(self.prefix)
         preview = Preview(
-            self.prefix,
             operation,
             _json(params),
             created.isoformat(),
@@ -490,9 +490,9 @@ class TraderService:
             ).hexdigest()
             strategy_reservation = money(params.get("strategy_reservation_usd", "0"))
             owner_reservation = money(params.get("owner_reservation_usd", "0"))
+            self.store.open(self.prefix)
             with db0.atomic():
                 intent = Intent(
-                    self.prefix,
                     preview,
                     idempotency_key,
                     preview.operation,
@@ -504,7 +504,6 @@ class TraderService:
                 )
                 self.store.tag(intent, key_tag, "INTENT")
                 reservation = Reservation(
-                    self.prefix,
                     intent,
                     str(strategy_reservation),
                     str(owner_reservation),
@@ -623,6 +622,7 @@ class TraderService:
         binding: Any,
     ) -> None:
         assert self.store is not None and self.prefix is not None
+        self.store.open(self.prefix)
         intent.state = outcome.state.value
         intent.broker_order_id = outcome.broker_order_id or ""
         intent.broker_position_id = outcome.broker_position_id or ""
@@ -639,7 +639,6 @@ class TraderService:
             order_state = "PENDING" if outcome.state is IntentState.ACKNOWLEDGED else outcome.state.value
             if order is None:
                 order = Order(
-                    self.prefix,
                     outcome.broker_order_id,
                     intent,
                     params.get("symbol") or "",
@@ -659,7 +658,6 @@ class TraderService:
                 )
             )
             position = Position(
-                self.prefix,
                 outcome.broker_position_id,
                 intent,
                 params.get("symbol") or "",
@@ -671,7 +669,6 @@ class TraderService:
             )
             self.store.tag(position, "POSITION")
             entry = LedgerEntry(
-                self.prefix,
                 "strategy",
                 "ACTUAL_FILL",
                 params["strategy_notional_usd"],
