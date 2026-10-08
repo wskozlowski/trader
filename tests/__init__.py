@@ -1,0 +1,1 @@
+"""Trader service test suite."""
