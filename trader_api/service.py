@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import dbzero as db0  # type: ignore[import-untyped]
 
@@ -20,14 +20,14 @@ from .config import Profile, fixed_storage_root, load_profile
 from .domain import BrokerMutation, BrokerOutcome, Budget, IntentState, Lifecycle, money, utc_now
 from .errors import TraderError
 from .storage import (
-    AuditEventMemo,
+    AuditEvent,
     DbzeroStore,
-    IntentMemo,
-    LedgerEntryMemo,
-    OrderMemo,
-    PositionMemo,
-    PreviewMemo,
-    ReservationMemo,
+    Intent,
+    LedgerEntry,
+    Order,
+    Position,
+    Preview,
+    Reservation,
 )
 
 _submission_locks: dict[str, threading.RLock] = {}
@@ -276,11 +276,9 @@ class TraderService:
     ) -> dict[str, Any]:
         assert self.store is not None and self.prefix is not None
         created = self._clock()
-        preview_id = "pv_" + uuid.uuid4().hex
         expires = created + timedelta(minutes=5)
-        preview = PreviewMemo(
+        preview = Preview(
             self.prefix,
-            preview_id,
             operation,
             _json(params),
             created.isoformat(),
@@ -289,10 +287,10 @@ class TraderService:
             int(binding.binding_version),
             int(state.policy_version),
         )
-        self.store.tag(preview, f"preview:{preview_id}", "PREVIEW", f"operation:{operation}")
+        self.store.tag(preview, "PREVIEW", f"operation:{operation}")
         self.store.commit(self.prefix)
         return {
-            "preview_id": preview_id,
+            "preview_id": str(db0.uuid(preview)),
             "operation": operation,
             "created_at": created.isoformat(),
             "expires_at": expires.isoformat(),
@@ -380,16 +378,16 @@ class TraderService:
         }
         return self._persist_preview("open", params, state, binding, fingerprint)
 
-    def _owned_position(self, position_id: str) -> PositionMemo:
+    def _owned_position(self, position_id: str) -> Position:
         assert self.store is not None and self.prefix is not None
-        position = self.store.one(PositionMemo, f"position:{position_id}", prefix=self.prefix)
+        position = self.store.one(Position, position_id, prefix=self.prefix)
         if position is None or position.state != "OPEN":
             raise TraderError("NOT_FOUND", "position not found")
         return position
 
-    def _owned_order(self, order_id: str) -> OrderMemo:
+    def _owned_order(self, order_id: str) -> Order:
         assert self.store is not None and self.prefix is not None
-        order = self.store.one(OrderMemo, f"order:{order_id}", prefix=self.prefix)
+        order = self.store.one(Order, order_id, prefix=self.prefix)
         if order is None or order.state not in {"PENDING", "ACKNOWLEDGED"}:
             raise TraderError("NOT_FOUND", "order not found")
         return order
@@ -441,14 +439,21 @@ class TraderService:
             "cancel", {"order_id": order_id}, state, binding, self.broker.state_fingerprint(self._context)
         )
 
-    def _preview(self, preview_id: str) -> PreviewMemo:
-        assert self.store is not None and self.prefix is not None
-        preview = self.store.one(PreviewMemo, f"preview:{preview_id}", prefix=self.prefix)
-        if preview is None:
-            raise TraderError("NOT_FOUND", "preview not found")
+    def _api_reference[T](self, identifier: str, model: type[T]) -> T:
+        """Resolve an incoming API ID once, checking both type and trader ownership."""
+        assert self.prefix is not None
+        try:
+            item = db0.fetch(identifier, model)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise TraderError("NOT_FOUND", f"{model.__name__.lower()} not found") from exc
+        # fetch's prefix argument only scopes singleton lookups, not UUID lookups.
+        if db0.get_prefix_of(item).name != self.prefix.lstrip("/"):
+            raise TraderError("NOT_FOUND", f"{model.__name__.lower()} not found")
+        return cast(T, item)
+
+    def _validate_preview(self, preview: Preview) -> None:
         if datetime.fromisoformat(preview.expires_at).astimezone(UTC) <= self._clock():
             raise TraderError("STALE_PREVIEW", "preview expired")
-        return preview
 
     def submit(self, preview_id: str, idempotency_key: str) -> dict[str, Any]:
         if not idempotency_key or len(idempotency_key) > 200:
@@ -463,12 +468,13 @@ class TraderService:
         key_digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
         key_tag = f"key:{binding.binding_version}:{key_digest}"
         with _submission_lock(self.prefix):
-            prior = self.store.one(IntentMemo, key_tag, prefix=self.prefix)
+            preview = self._api_reference(preview_id, Preview)
+            prior = self.store.one(Intent, key_tag, prefix=self.prefix)
             if prior is not None:
-                if prior.preview_id != preview_id:
+                if prior.preview != preview:
                     raise TraderError("IDEMPOTENCY_CONFLICT", "idempotency key was used for another preview")
                 return self._intent_value(prior)
-            preview = self._preview(preview_id)
+            self._validate_preview(preview)
             state, binding = self._validate_binding(active=True, write=True, reduction=preview.operation != "open")
             if preview.binding_version != binding.binding_version or preview.policy_version != state.policy_version:
                 raise TraderError("STALE_PREVIEW", "binding or policy changed")
@@ -477,7 +483,6 @@ class TraderService:
             params = json.loads(preview.params_json)
             self._revalidate_admission(preview.operation, params, state, binding)
             request_id = str(uuid.uuid4())
-            intent_id = "intent_" + uuid.uuid4().hex
             command_digest = hashlib.sha256(
                 _json(
                     [self.environment, self.trader_id, binding.binding_version, preview.operation, params, request_id]
@@ -486,10 +491,9 @@ class TraderService:
             strategy_reservation = money(params.get("strategy_reservation_usd", "0"))
             owner_reservation = money(params.get("owner_reservation_usd", "0"))
             with db0.atomic():
-                intent = IntentMemo(
+                intent = Intent(
                     self.prefix,
-                    intent_id,
-                    preview_id,
+                    preview,
                     idempotency_key,
                     preview.operation,
                     preview.params_json,
@@ -498,16 +502,16 @@ class TraderService:
                     int(binding.binding_version),
                     int(state.policy_version),
                 )
-                self.store.tag(intent, key_tag, f"intent:{intent_id}", f"request:{request_id}", "INTENT")
-                reservation = ReservationMemo(
+                self.store.tag(intent, key_tag, "INTENT")
+                reservation = Reservation(
                     self.prefix,
-                    intent_id,
+                    intent,
                     str(strategy_reservation),
                     str(owner_reservation),
                     int(binding.binding_version),
                     int(state.policy_version),
                 )
-                self.store.tag(reservation, f"intent:{intent_id}", "RESERVATION")
+                self.store.tag(reservation, "RESERVATION")
                 state.strategy_committed = str(money(state.strategy_committed) + strategy_reservation)
                 state.owner_committed = str(money(state.owner_committed) + owner_reservation)
                 self.store.append_audit(
@@ -515,7 +519,7 @@ class TraderService:
                     state,
                     kind="INTENT_COMMITTED",
                     actor=self.trader_id,
-                    intent_id=intent_id,
+                    intent=intent,
                     facts={"operation": preview.operation, "request_id": request_id},
                 )
             self.store.commit(self.prefix)
@@ -611,8 +615,8 @@ class TraderService:
 
     def _project_outcome(
         self,
-        intent: IntentMemo,
-        reservation: ReservationMemo,
+        intent: Intent,
+        reservation: Reservation,
         outcome: BrokerOutcome,
         params: dict[str, Any],
         state: Any,
@@ -631,17 +635,17 @@ class TraderService:
             )
             reservation.state = "RELEASED"
         if outcome.broker_order_id and intent.operation == "open":
-            order = self.store.one(OrderMemo, f"order:{outcome.broker_order_id}", prefix=self.prefix)
+            order = self.store.one(Order, outcome.broker_order_id, prefix=self.prefix)
             order_state = "PENDING" if outcome.state is IntentState.ACKNOWLEDGED else outcome.state.value
             if order is None:
-                order = OrderMemo(
+                order = Order(
                     self.prefix,
                     outcome.broker_order_id,
-                    intent.intent_id,
+                    intent,
                     params.get("symbol") or "",
                     order_state,
                 )
-                self.store.tag(order, f"order:{outcome.broker_order_id}", f"intent:{intent.intent_id}", "ORDER")
+                self.store.tag(order, "ORDER")
             else:
                 order.state = order_state
         if intent.operation == "open" and outcome.state is IntentState.FILLED and outcome.broker_position_id:
@@ -654,10 +658,10 @@ class TraderService:
                     allow_negative=True,
                 )
             )
-            position = PositionMemo(
+            position = Position(
                 self.prefix,
                 outcome.broker_position_id,
-                intent.intent_id,
+                intent,
                 params.get("symbol") or "",
                 params["side"],
                 int(params["instrument_id"]),
@@ -665,17 +669,16 @@ class TraderService:
                 params["strategy_notional_usd"],
                 str(outcome.filled_units or Decimal(params["broker_units"])),
             )
-            self.store.tag(position, f"position:{outcome.broker_position_id}", f"intent:{intent.intent_id}", "POSITION")
-            entry = LedgerEntryMemo(
+            self.store.tag(position, "POSITION")
+            entry = LedgerEntry(
                 self.prefix,
-                "led_" + uuid.uuid4().hex,
                 "strategy",
                 "ACTUAL_FILL",
                 params["strategy_notional_usd"],
-                intent.intent_id,
+                intent,
                 self._clock().isoformat(),
             )
-            self.store.tag(entry, "LEDGER", "domain:strategy", f"intent:{intent.intent_id}")
+            self.store.tag(entry, "LEDGER")
             binding.copy_healthy = False
         elif intent.operation == "close" and outcome.state is IntentState.FILLED:
             position = self._owned_position(params["position_id"])
@@ -702,7 +705,7 @@ class TraderService:
         elif intent.operation == "cancel" and outcome.state in {IntentState.FILLED, IntentState.CANCELED}:
             order = self._owned_order(params["order_id"])
             order.state = "CANCELED"
-            original_reservation = self.store.one(ReservationMemo, f"intent:{order.intent_id}", prefix=self.prefix)
+            original_reservation = self.store.one(Reservation, db0.as_tag(order.intent), prefix=self.prefix)
             if original_reservation is not None and original_reservation.state == "HELD":
                 state.strategy_committed = str(
                     max(
@@ -728,7 +731,7 @@ class TraderService:
             state,
             kind=f"BROKER_{outcome.state.value}",
             actor="coordinator",
-            intent_id=intent.intent_id,
+            intent=intent,
             facts={
                 "operation": intent.operation,
                 "request_id": outcome.request_id,
@@ -739,9 +742,9 @@ class TraderService:
             },
         )
 
-    def _intent_value(self, intent: IntentMemo) -> dict[str, Any]:
+    def _intent_value(self, intent: Intent) -> dict[str, Any]:
         return {
-            "intent_id": intent.intent_id,
+            "intent_id": str(db0.uuid(intent)),
             "operation": intent.operation,
             "state": intent.state,
             "request_id": intent.request_id,
@@ -755,9 +758,7 @@ class TraderService:
     def intent_status(self, intent_id: str) -> dict[str, Any]:
         self._validate_binding(active=True)
         assert self.store is not None and self.prefix is not None
-        intent = self.store.one(IntentMemo, f"intent:{intent_id}", prefix=self.prefix)
-        if intent is None:
-            raise TraderError("NOT_FOUND", "intent not found")
+        intent = self._api_reference(intent_id, Intent)
         return self._intent_value(intent)
 
     def positions(self) -> list[dict[str, Any]]:
@@ -776,7 +777,7 @@ class TraderService:
                 "take_profit_rate": item.take_profit_rate or None,
                 "state": item.state,
             }
-            for item in self.store.all(PositionMemo, "POSITION", prefix=self.prefix)
+            for item in self.store.all(Position, "POSITION", prefix=self.prefix)
             if item.state == "OPEN"
         ]
 
@@ -784,8 +785,13 @@ class TraderService:
         self._validate_binding(active=True)
         assert self.store is not None and self.prefix is not None
         return [
-            {"order_id": item.order_id, "symbol": item.symbol, "state": item.state, "intent_id": item.intent_id}
-            for item in self.store.all(OrderMemo, "ORDER", prefix=self.prefix)
+            {
+                "order_id": item.order_id,
+                "symbol": item.symbol,
+                "state": item.state,
+                "intent_id": str(db0.uuid(item.intent)),
+            }
+            for item in self.store.all(Order, "ORDER", prefix=self.prefix)
             if item.state in {"PENDING", "ACKNOWLEDGED"}
         ]
 
@@ -801,11 +807,9 @@ class TraderService:
         unresolved = 0
         controls = list(self.store.unresolved_control(self.storage_key))
         control_digests = {str(control.command_digest) for control in controls}
-        for local_intent in self.store.all(IntentMemo, "INTENT", prefix=self.prefix):
+        for local_intent in self.store.all(Intent, "INTENT", prefix=self.prefix):
             if local_intent.state == IntentState.COMMITTED.value and local_intent.command_digest not in control_digests:
-                local_reservation = self.store.one(
-                    ReservationMemo, f"intent:{local_intent.intent_id}", prefix=self.prefix
-                )
+                local_reservation = self.store.one(Reservation, db0.as_tag(local_intent), prefix=self.prefix)
                 if local_reservation is not None and local_reservation.state == "HELD":
                     state.strategy_committed = str(
                         max(
@@ -826,12 +830,12 @@ class TraderService:
                     state,
                     kind="ORPHAN_INTENT_CANCELED",
                     actor="coordinator",
-                    intent_id=local_intent.intent_id,
+                    intent=local_intent,
                     source="reconcile",
                 )
                 recovered += 1
         for control in controls:
-            intent = self.store.one(IntentMemo, f"request:{control.request_id}", prefix=self.prefix)
+            intent = self.store.one(Intent, control.request_id, prefix=self.prefix)
             if control.state in {"RESERVED", IntentState.UNKNOWN.value}:
                 outcome = self.broker.lookup_request(self._context, control.request_id)
                 if outcome is None:
@@ -881,7 +885,7 @@ class TraderService:
                 IntentState.UNKNOWN.value,
                 IntentState.ACKNOWLEDGED.value,
             }:
-                reservation = self.store.one(ReservationMemo, f"intent:{intent.intent_id}", prefix=self.prefix)
+                reservation = self.store.one(Reservation, db0.as_tag(intent), prefix=self.prefix)
                 if reservation is not None:
                     self._project_outcome(intent, reservation, outcome, json.loads(intent.params_json), state, binding)
                     recovered += 1
@@ -906,15 +910,15 @@ class TraderService:
         assert self.store is not None and self.prefix is not None
         if limit < 1 or limit > 1000:
             raise TraderError("INVALID_LIMIT", "limit must be in [1, 1000]")
-        events = sorted(self.store.all(AuditEventMemo, "AUDIT", prefix=self.prefix), key=lambda item: item.sequence)
+        events = sorted(self.store.all(AuditEvent, "AUDIT", prefix=self.prefix), key=lambda item: item.sequence)
         return [
             {
-                "event_id": event.event_id,
+                "event_id": str(db0.uuid(event)),
                 "sequence": event.sequence,
                 "occurred_at": event.occurred_at,
                 "kind": event.kind,
                 "actor": event.actor,
-                "intent_id": event.intent_id or None,
+                "intent_id": str(db0.uuid(event.intent)) if event.intent is not None else None,
                 "source": event.source,
                 "facts": json.loads(event.facts_json),
                 "previous_hash": event.previous_hash,
@@ -931,17 +935,15 @@ class TraderService:
     def portfolio_history(self, *, limit: int = 100) -> dict[str, Any]:
         self._validate_binding(active=True)
         assert self.store is not None and self.prefix is not None
-        entries = sorted(
-            self.store.all(LedgerEntryMemo, "LEDGER", prefix=self.prefix), key=lambda item: item.occurred_at
-        )
+        entries = sorted(self.store.all(LedgerEntry, "LEDGER", prefix=self.prefix), key=lambda item: item.occurred_at)
         result: dict[str, list[dict[str, Any]]] = {"strategy": [], "owner_mirror": []}
         for item in entries[-limit:]:
             result[item.domain].append(
                 {
-                    "entry_id": item.entry_id,
+                    "entry_id": str(db0.uuid(item)),
                     "kind": item.kind,
                     "amount_usd": item.amount_usd,
-                    "intent_id": item.intent_id or None,
+                    "intent_id": str(db0.uuid(item.intent)) if item.intent is not None else None,
                     "occurred_at": item.occurred_at,
                 }
             )

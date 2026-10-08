@@ -17,7 +17,7 @@ T = TypeVar("T")
 
 
 @db0.memo(singleton=True)
-class TraderStateMemo:
+class TraderState:
     def __init__(self, prefix: str, trader_id: str, environment: str) -> None:
         db0.set_prefix(self, prefix)
         self.trader_id = trader_id
@@ -36,7 +36,7 @@ class TraderStateMemo:
 
 
 @db0.memo(singleton=True)
-class PortfolioBindingMemo:
+class PortfolioBinding:
     def __init__(self, prefix: str) -> None:
         db0.set_prefix(self, prefix)
         self.environment = ""
@@ -58,11 +58,10 @@ class PortfolioBindingMemo:
 
 
 @db0.memo
-class PreviewMemo:
+class Preview:
     def __init__(
         self,
         prefix: str,
-        preview_id: str,
         operation: str,
         params_json: str,
         created_at: str,
@@ -72,7 +71,6 @@ class PreviewMemo:
         policy_version: int,
     ) -> None:
         db0.set_prefix(self, prefix)
-        self.preview_id = preview_id
         self.operation = operation
         self.params_json = params_json
         self.created_at = created_at
@@ -83,12 +81,12 @@ class PreviewMemo:
 
 
 @db0.memo
-class IntentMemo:
+@db0.tag_fields("preview", "request_id")
+class Intent:
     def __init__(
         self,
         prefix: str,
-        intent_id: str,
-        preview_id: str,
+        preview: Preview,
         idempotency_key: str,
         operation: str,
         params_json: str,
@@ -98,8 +96,7 @@ class IntentMemo:
         policy_version: int,
     ) -> None:
         db0.set_prefix(self, prefix)
-        self.intent_id = intent_id
-        self.preview_id = preview_id
+        self.preview = preview
         self.idempotency_key = idempotency_key
         self.operation = operation
         self.params_json = params_json
@@ -115,18 +112,19 @@ class IntentMemo:
 
 
 @db0.memo
-class ReservationMemo:
+@db0.tag_fields("intent")
+class Reservation:
     def __init__(
         self,
         prefix: str,
-        intent_id: str,
+        intent: Intent,
         strategy_amount_usd: str,
         owner_amount_usd: str,
         binding_version: int,
         policy_version: int,
     ) -> None:
         db0.set_prefix(self, prefix)
-        self.intent_id = intent_id
+        self.intent = intent
         self.strategy_amount_usd = strategy_amount_usd
         self.owner_amount_usd = owner_amount_usd
         self.binding_version = binding_version
@@ -135,12 +133,13 @@ class ReservationMemo:
 
 
 @db0.memo
-class PositionMemo:
+@db0.tag_fields("intent", "position_id")
+class Position:
     def __init__(
         self,
         prefix: str,
         position_id: str,
-        intent_id: str,
+        intent: Intent,
         symbol: str,
         side: str,
         instrument_id: int,
@@ -150,7 +149,7 @@ class PositionMemo:
     ) -> None:
         db0.set_prefix(self, prefix)
         self.position_id = position_id
-        self.intent_id = intent_id
+        self.intent = intent
         self.symbol = symbol
         self.side = side
         self.instrument_id = instrument_id
@@ -163,45 +162,45 @@ class PositionMemo:
 
 
 @db0.memo
-class OrderMemo:
+@db0.tag_fields("intent", "order_id")
+class Order:
     def __init__(
         self,
         prefix: str,
         order_id: str,
-        intent_id: str,
+        intent: Intent,
         symbol: str,
         state: str,
     ) -> None:
         db0.set_prefix(self, prefix)
         self.order_id = order_id
-        self.intent_id = intent_id
+        self.intent = intent
         self.symbol = symbol
         self.state = state
 
 
 @db0.memo(immutable=True)
-class AuditEventMemo:
+@db0.tag_fields("intent", "kind")
+class AuditEvent:
     def __init__(
         self,
         prefix: str,
-        event_id: str,
         sequence: int,
         occurred_at: str,
         kind: str,
         actor: str,
-        intent_id: str,
+        intent: Intent | None,
         source: str,
         facts_json: str,
         previous_hash: str,
         event_hash: str,
     ) -> None:
         db0.set_prefix(self, prefix)
-        self.event_id = event_id
         self.sequence = sequence
         self.occurred_at = occurred_at
         self.kind = kind
         self.actor = actor
-        self.intent_id = intent_id
+        self.intent = intent
         self.source = source
         self.facts_json = facts_json
         self.previous_hash = previous_hash
@@ -209,28 +208,27 @@ class AuditEventMemo:
 
 
 @db0.memo(immutable=True)
-class LedgerEntryMemo:
+@db0.tag_fields("intent", "domain")
+class LedgerEntry:
     def __init__(
         self,
         prefix: str,
-        entry_id: str,
         domain: str,
         kind: str,
         amount_usd: str,
-        intent_id: str,
+        intent: Intent | None,
         occurred_at: str,
     ) -> None:
         db0.set_prefix(self, prefix)
-        self.entry_id = entry_id
         self.domain = domain
         self.kind = kind
         self.amount_usd = amount_usd
-        self.intent_id = intent_id
+        self.intent = intent
         self.occurred_at = occurred_at
 
 
 @db0.memo
-class TraderRegistrationMemo:
+class TraderRegistration:
     def __init__(
         self,
         prefix: str,
@@ -248,7 +246,7 @@ class TraderRegistrationMemo:
 
 
 @db0.memo
-class ControlReservationMemo:
+class ControlReservation:
     def __init__(
         self,
         prefix: str,
@@ -267,7 +265,7 @@ class ControlReservationMemo:
 
 
 @db0.memo
-class ProvisioningIntentMemo:
+class ProvisioningIntent:
     def __init__(
         self,
         prefix: str,
@@ -292,7 +290,7 @@ class ProvisioningIntentMemo:
 
 
 @db0.memo(immutable=True)
-class OwnershipClaimMemo:
+class OwnershipClaim:
     def __init__(
         self,
         prefix: str,
@@ -309,7 +307,7 @@ class OwnershipClaimMemo:
 
 
 @db0.memo
-class TokenVerificationMemo:
+class TokenVerification:
     def __init__(
         self,
         prefix: str,
@@ -335,7 +333,7 @@ class TokenVerificationMemo:
 
 
 @db0.memo(singleton=True)
-class ControlStateMemo:
+class ControlState:
     def __init__(self, prefix: str) -> None:
         db0.set_prefix(self, prefix)
         self.audit_sequence = 0
@@ -343,7 +341,7 @@ class ControlStateMemo:
 
 
 @db0.memo(immutable=True)
-class ControlEventMemo:
+class ControlEvent:
     def __init__(
         self,
         prefix: str,
@@ -414,14 +412,14 @@ class DbzeroStore:
 
     def register(self, trader_id: str, service_credential: str) -> str:
         trader_hash = self.trader_hash(trader_id)
-        existing = self.one(TraderRegistrationMemo, f"trader:{trader_hash}", prefix=self.control_prefix)
+        existing = self.one(TraderRegistration, f"trader:{trader_hash}", prefix=self.control_prefix)
         credential_hash = hashlib.sha256(service_credential.encode()).hexdigest()
         if existing is not None:
             if existing.trader_id != trader_id or existing.service_credential_hash != credential_hash:
                 raise TraderError("TRADER_MISMATCH", "trader registration does not match credentials")
             return str(existing.storage_key)
         storage_key = str(uuid.uuid4())
-        item = TraderRegistrationMemo(self.control_prefix, trader_hash, trader_id, storage_key, credential_hash)
+        item = TraderRegistration(self.control_prefix, trader_hash, trader_id, storage_key, credential_hash)
         db0.tags(item).add([f"trader:{trader_hash}", f"storage:{storage_key}"])
         self.append_control_event("TRADER_REGISTERED", {"trader_hash": trader_hash})
         db0.commit(self.control_prefix)
@@ -429,7 +427,7 @@ class DbzeroStore:
 
     def authenticate(self, trader_id: str, service_credential: str | None) -> str:
         trader_hash = self.trader_hash(trader_id)
-        registration = self.one(TraderRegistrationMemo, f"trader:{trader_hash}", prefix=self.control_prefix)
+        registration = self.one(TraderRegistration, f"trader:{trader_hash}", prefix=self.control_prefix)
         if registration is None or not registration.authorized or service_credential is None:
             raise TraderError("AUTHENTICATION_REQUIRED", "valid local service credentials are required")
         presented = hashlib.sha256(service_credential.encode()).hexdigest()
@@ -448,12 +446,12 @@ class DbzeroStore:
         self._open(prefix)
         return prefix
 
-    def one(self, model: type[T], tag: str | None = None, *, prefix: str) -> T | None:
+    def one(self, model: type[T], tag: Any = None, *, prefix: str) -> T | None:
         self._open(prefix)
-        query = db0.find(model, *([tag] if tag else []), prefix=prefix)
+        query = db0.find(model, *([tag] if tag is not None else []), prefix=prefix)
         return cast(T | None, next(iter(query), None))
 
-    def all(self, model: type[T], *tags: str, prefix: str) -> list[T]:
+    def all(self, model: type[T], *tags: Any, prefix: str) -> list[T]:
         self._open(prefix)
         return cast(list[T], list(db0.find(model, *tags, prefix=prefix)))
 
@@ -463,53 +461,53 @@ class DbzeroStore:
     def commit(self, prefix: str) -> None:
         db0.commit(prefix)
 
-    def state(self, prefix: str, trader_id: str) -> TraderStateMemo:
+    def state(self, prefix: str, trader_id: str) -> TraderState:
         self._open(prefix)
-        return TraderStateMemo(prefix, trader_id, self.environment.value)
+        return TraderState(prefix, trader_id, self.environment.value)
 
-    def binding(self, prefix: str) -> PortfolioBindingMemo:
+    def binding(self, prefix: str) -> PortfolioBinding:
         self._open(prefix)
-        return PortfolioBindingMemo(prefix)
+        return PortfolioBinding(prefix)
 
     def append_audit(
         self,
         prefix: str,
-        state: TraderStateMemo,
+        state: TraderState,
         *,
         kind: str,
         actor: str,
-        intent_id: str = "",
+        intent: Intent | None = None,
         source: str = "trader",
         facts: dict[str, Any] | None = None,
-    ) -> AuditEventMemo:
+    ) -> AuditEvent:
         safe_facts = json.dumps(facts or {}, sort_keys=True, separators=(",", ":"))
         sequence = int(state.audit_sequence) + 1
         occurred_at = utc_now().isoformat()
+        command_digest = intent.command_digest if intent is not None else ""
         body = json.dumps(
-            [sequence, occurred_at, kind, actor, intent_id, source, safe_facts, state.audit_head],
+            [sequence, occurred_at, kind, actor, command_digest, source, safe_facts, state.audit_head],
             separators=(",", ":"),
         )
         event_hash = hashlib.sha256(body.encode()).hexdigest()
-        event = AuditEventMemo(
+        event = AuditEvent(
             prefix,
-            f"evt_{uuid.uuid4().hex}",
             sequence,
             occurred_at,
             kind,
             actor,
-            intent_id,
+            intent,
             source,
             safe_facts,
             str(state.audit_head),
             event_hash,
         )
-        self.tag(event, "AUDIT", f"kind:{kind}", *([f"intent:{intent_id}"] if intent_id else []))
+        self.tag(event, "AUDIT")
         state.audit_sequence = sequence
         state.audit_head = event_hash
         return event
 
-    def verify_audit(self, prefix: str, state: TraderStateMemo) -> dict[str, Any]:
-        events = sorted(self.all(AuditEventMemo, "AUDIT", prefix=prefix), key=lambda item: item.sequence)
+    def verify_audit(self, prefix: str, state: TraderState) -> dict[str, Any]:
+        events = sorted(self.all(AuditEvent, "AUDIT", prefix=prefix), key=lambda item: item.sequence)
         previous = "0" * 64
         for expected_sequence, event in enumerate(events, 1):
             body = json.dumps(
@@ -518,7 +516,7 @@ class DbzeroStore:
                     event.occurred_at,
                     event.kind,
                     event.actor,
-                    event.intent_id,
+                    event.intent.command_digest if event.intent is not None else "",
                     event.source,
                     event.facts_json,
                     event.previous_hash,
@@ -537,11 +535,11 @@ class DbzeroStore:
         return {"valid": valid, "checked_events": len(events), "head": previous}
 
     def assert_prefix_isolation(self) -> None:
-        registrations = self.all(TraderRegistrationMemo, prefix=self.control_prefix)
+        registrations = self.all(TraderRegistration, prefix=self.control_prefix)
         storage_keys = [item.storage_key for item in registrations]
         if len(storage_keys) != len(set(storage_keys)):
             raise TraderError("STORAGE_INVALID", "a trader storage prefix has multiple registrations")
-        if self.all(TraderStateMemo, prefix=self.control_prefix):
+        if self.all(TraderState, prefix=self.control_prefix):
             raise TraderError("STORAGE_INVALID", "trader data exists in the control prefix")
 
     def reserve_control(
@@ -551,13 +549,11 @@ class DbzeroStore:
         storage_key: str,
         request_id: str,
         binding_version: int,
-    ) -> ControlReservationMemo:
-        existing = self.one(ControlReservationMemo, f"command:{command_digest}", prefix=self.control_prefix)
+    ) -> ControlReservation:
+        existing = self.one(ControlReservation, f"command:{command_digest}", prefix=self.control_prefix)
         if existing is not None:
             return existing
-        reservation = ControlReservationMemo(
-            self.control_prefix, command_digest, storage_key, request_id, binding_version
-        )
+        reservation = ControlReservation(self.control_prefix, command_digest, storage_key, request_id, binding_version)
         self.tag(reservation, f"command:{command_digest}", f"storage:{storage_key}", "CONTROL_RESERVATION")
         self.append_control_event(
             "CONTROL_RESERVATION_COMMITTED",
@@ -566,8 +562,8 @@ class DbzeroStore:
         self.commit(self.control_prefix)
         return reservation
 
-    def unresolved_control(self, storage_key: str) -> Iterable[ControlReservationMemo]:
-        return self.all(ControlReservationMemo, f"storage:{storage_key}", prefix=self.control_prefix)
+    def unresolved_control(self, storage_key: str) -> Iterable[ControlReservation]:
+        return self.all(ControlReservation, f"storage:{storage_key}", prefix=self.control_prefix)
 
     def claim_ownership(
         self,
@@ -581,18 +577,18 @@ class DbzeroStore:
     ) -> None:
         scoped_key = "\x1f".join([environment, trading_account_id, trading_portfolio_id, entity_type, broker_id])
         digest = hashlib.sha256(scoped_key.encode()).hexdigest()
-        existing = self.one(OwnershipClaimMemo, f"ownership:{digest}", prefix=self.control_prefix)
+        existing = self.one(OwnershipClaim, f"ownership:{digest}", prefix=self.control_prefix)
         if existing is not None:
             if existing.storage_key != storage_key:
                 raise TraderError("BROKER_CAPACITY_UNAVAILABLE", "broker entity is already claimed")
             return
-        claim = OwnershipClaimMemo(self.control_prefix, digest, storage_key, entity_type, broker_id)
+        claim = OwnershipClaim(self.control_prefix, digest, storage_key, entity_type, broker_id)
         self.tag(claim, f"ownership:{digest}", f"storage:{storage_key}", "OWNERSHIP")
         self.append_control_event("OWNERSHIP_CLAIMED", {"scoped_key_digest": digest, "entity_type": entity_type})
 
     def record_scope_evidence(self, credential_fingerprint: str, evidence: Any) -> None:
         tag = f"credential:{credential_fingerprint}"
-        existing = self.one(TokenVerificationMemo, tag, prefix=self.control_prefix)
+        existing = self.one(TokenVerification, tag, prefix=self.control_prefix)
         identity = (
             evidence.subject_id,
             evidence.trading_account_id,
@@ -609,7 +605,7 @@ class DbzeroStore:
             existing.expires_at = "" if evidence.expires_at is None else evidence.expires_at.isoformat()
             existing.revoked = bool(evidence.revoked)
         else:
-            existing = TokenVerificationMemo(
+            existing = TokenVerification(
                 self.control_prefix,
                 credential_fingerprint,
                 sorted(evidence.scopes),
@@ -627,21 +623,21 @@ class DbzeroStore:
         )
         self.commit(self.control_prefix)
 
-    def scope_evidence(self, credential_fingerprint: str) -> TokenVerificationMemo | None:
+    def scope_evidence(self, credential_fingerprint: str) -> TokenVerification | None:
         return self.one(
-            TokenVerificationMemo,
+            TokenVerification,
             f"credential:{credential_fingerprint}",
             prefix=self.control_prefix,
         )
 
-    def append_control_event(self, kind: str, facts: dict[str, Any]) -> ControlEventMemo:
-        state = ControlStateMemo(self.control_prefix)
+    def append_control_event(self, kind: str, facts: dict[str, Any]) -> ControlEvent:
+        state = ControlState(self.control_prefix)
         sequence = int(state.audit_sequence) + 1
         occurred_at = utc_now().isoformat()
         facts_json = json.dumps(facts, sort_keys=True, separators=(",", ":"))
         body = json.dumps([sequence, occurred_at, kind, facts_json, state.audit_head], separators=(",", ":"))
         event_hash = hashlib.sha256(body.encode()).hexdigest()
-        event = ControlEventMemo(
+        event = ControlEvent(
             self.control_prefix,
             sequence,
             occurred_at,
@@ -656,9 +652,9 @@ class DbzeroStore:
         return event
 
     def verify_control_audit(self) -> dict[str, Any]:
-        state = ControlStateMemo(self.control_prefix)
+        state = ControlState(self.control_prefix)
         events = sorted(
-            self.all(ControlEventMemo, "CONTROL_AUDIT", prefix=self.control_prefix),
+            self.all(ControlEvent, "CONTROL_AUDIT", prefix=self.control_prefix),
             key=lambda item: item.sequence,
         )
         previous = "0" * 64

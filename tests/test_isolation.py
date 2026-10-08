@@ -68,11 +68,14 @@ def test_two_traders_with_overlapping_symbols_are_physically_isolated(
     alpha.initialize("2000")
     beta.initialize("2000")
     alpha_preview = alpha.preview_open(symbol="AAPL", side="long", strategy_notional_usd="100")
-    alpha.submit(alpha_preview["preview_id"], "shared-looking-key")
+    alpha_intent = alpha.submit(alpha_preview["preview_id"], "shared-looking-key")
     assert beta.positions() == []
     with pytest.raises(TraderError) as foreign_preview:
         beta.submit(alpha_preview["preview_id"], "shared-looking-key")
     assert foreign_preview.value.code == "NOT_FOUND"
+    with pytest.raises(TraderError) as foreign_intent:
+        beta.intent_status(alpha_intent["intent_id"])
+    assert foreign_intent.value.code == "NOT_FOUND"
     beta_preview = beta.preview_open(symbol="AAPL", side="long", strategy_notional_usd="100")
     beta.submit(beta_preview["preview_id"], "shared-looking-key")
     assert alpha.positions()[0]["symbol"] == beta.positions()[0]["symbol"] == "AAPL"

@@ -54,6 +54,17 @@ Physical roots are fixed at `/dbzero-data/trader-dev` for demo and `/dbzero-data
 Tests may use child directories beneath the demo root. No dotenv, environment variable, or CLI option
 can redirect the real root.
 
+Persistent models use plain names (`Intent`, `Preview`, etc.) and store related memo objects
+directly. UUIDs are serialized only for API responses and exports; incoming API IDs are
+resolved to instances with type and trader-prefix checks. Internal links, comparisons, and
+relationship queries use instances, with no UUID lookup tags. `tag_fields` indexes relationships and broker IDs,
+with object-tag queries using `db0.as_tag(instance)`. Broker/request IDs and opaque trader
+storage keys retain their external identity and routing roles.
+Audit hashes bind the referenced intent's command digest.
+
+This storage schema replaces the former `*Memo` classes and ID fields. Existing databases
+require migration before use; no automatic migration is included.
+
 ## Recovery, backup, and replay
 
 Submission uses four durable barriers: trader intent/reservation, control reservation, control

@@ -14,9 +14,9 @@ from .errors import TraderError
 from .secrets import CredentialVault
 from .storage import (
     DbzeroStore,
-    LedgerEntryMemo,
-    ProvisioningIntentMemo,
-    TraderRegistrationMemo,
+    LedgerEntry,
+    ProvisioningIntent,
+    TraderRegistration,
 )
 
 
@@ -87,7 +87,7 @@ class OwnerAdminService:
             raise TraderError("INVALID_PROVISIONING_REQUEST", "complete provisioning inputs are required")
         key_digest = hashlib.sha256(administrative_request_key.encode()).hexdigest()
         key_tag = f"provision-key:{key_digest}"
-        existing = self.store.one(ProvisioningIntentMemo, key_tag, prefix=self.store.control_prefix)
+        existing = self.store.one(ProvisioningIntent, key_tag, prefix=self.store.control_prefix)
         if existing is not None:
             return {
                 "request_id": existing.request_id,
@@ -101,7 +101,7 @@ class OwnerAdminService:
             else frozenset({REAL_READ, REAL_WRITE})
         )
         request_id = str(uuid.uuid4())
-        intent = ProvisioningIntentMemo(
+        intent = ProvisioningIntent(
             self.store.control_prefix,
             key_digest,
             request_id,
@@ -183,7 +183,7 @@ class OwnerAdminService:
     ) -> dict[str, object]:
         key_digest = hashlib.sha256(administrative_request_key.encode()).hexdigest()
         intent = self.store.one(
-            ProvisioningIntentMemo,
+            ProvisioningIntent,
             f"provision-key:{key_digest}",
             prefix=self.store.control_prefix,
         )
@@ -264,7 +264,7 @@ class OwnerAdminService:
 
     def set_suspended(self, *, trader_id: str, suspended: bool) -> dict[str, object]:
         registration = self.store.one(
-            TraderRegistrationMemo,
+            TraderRegistration,
             f"trader:{self.store.trader_hash(trader_id)}",
             prefix=self.store.control_prefix,
         )
@@ -301,7 +301,7 @@ class OwnerAdminService:
         copy_healthy: bool,
     ) -> dict[str, object]:
         registration = self.store.one(
-            TraderRegistrationMemo,
+            TraderRegistration,
             f"trader:{self.store.trader_hash(trader_id)}",
             prefix=self.store.control_prefix,
         )
@@ -315,16 +315,15 @@ class OwnerAdminService:
         state.owner_realized = str(realized)
         state.owner_committed = str(committed)
         binding.copy_healthy = bool(copy_healthy)
-        entry = LedgerEntryMemo(
+        entry = LedgerEntry(
             prefix,
-            "led_" + hashlib.sha256(f"{trader_id}:{utc_now().isoformat()}".encode()).hexdigest()[:24],
             "owner_mirror",
             "RECONCILED_ACTUAL",
             str(realized),
-            "",
+            None,
             utc_now().isoformat(),
         )
-        self.store.tag(entry, "LEDGER", "domain:owner_mirror")
+        self.store.tag(entry, "LEDGER")
         self.store.append_audit(prefix, state, kind="MIRROR_RECONCILED", actor="owner-admin", source="reconcile")
         self.store.commit(prefix)
         return {"copy_healthy": binding.copy_healthy, "actual_committed_usd": str(committed)}

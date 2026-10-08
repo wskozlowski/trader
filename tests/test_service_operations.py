@@ -7,6 +7,7 @@ import pytest
 from trader_api.domain import IntentState
 from trader_api.errors import TraderError
 from trader_api.service import TraderService
+from trader_api.storage import Preview
 
 
 def _service(runtime: dict[str, object]) -> TraderService:
@@ -95,10 +96,10 @@ def test_full_close_omits_units_but_partial_close_sends_them(runtime: dict[str, 
     service.initialize("2000")
     _open(service)
     full = service.preview_close(position_id="601", fraction="1")
-    full_params = json.loads(service._preview(full["preview_id"]).params_json)
+    full_params = json.loads(service._api_reference(full["preview_id"], Preview).params_json)
     assert "UnitsToDeduct" not in service._mutation("close", full_params, "request").payload
     partial = service.preview_close(position_id="601", fraction="0.5")
-    partial_params = json.loads(service._preview(partial["preview_id"]).params_json)
+    partial_params = json.loads(service._api_reference(partial["preview_id"], Preview).params_json)
     assert service._mutation("close", partial_params, "request").payload["UnitsToDeduct"]
 
 
