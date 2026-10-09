@@ -229,3 +229,31 @@ def test_close_submission_nested_contract(runtime: dict[str, object]) -> None:
     assert outcome.state is IntentState.ACKNOWLEDGED
     assert outcome.broker_order_id == "888"
     assert outcome.broker_position_id == "601"
+
+
+def test_confirmed_execution_prices_use_opening_units_not_remaining_units():
+    from trader_api.broker.etoro import _outcome
+
+    outcome = _outcome(
+        {
+            "orderId": 77,
+            "status": {"id": 3},
+            "totalCosts": "1.50",
+            "positionExecutions": [
+                {"positionId": 88, "remainingUnits": "0.5", "openingData": {"units": "2", "avgPrice": "100"}}
+            ],
+        },
+        "req",
+    )
+    assert outcome.filled_units == Decimal(2)
+    assert outcome.execution_price == Decimal(100)
+    assert outcome.actual_cost_usd == Decimal("1.50")
+    missing = _outcome(
+        {"orderId": 77, "status": {"id": 3}, "positionExecutions": [{"positionId": 88, "remainingUnits": "0.5"}]}, "req"
+    )
+    assert missing.execution_price is None and missing.filled_units is None
+    closed = _outcome(
+        {"orderID": 99, "statusID": 3, "positions": [{"positionID": 88, "units": "0.5", "rate": "110"}]}, "req-close"
+    )
+    assert closed.execution_price == Decimal(110) and closed.filled_units == Decimal("0.5")
+    assert closed.actual_cost_usd is None

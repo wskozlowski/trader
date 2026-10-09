@@ -99,6 +99,7 @@ class FakeBroker:
                 IntentState.FILLED,
                 mutation.request_id,
                 broker_order_id="502",
+                filled_units=Decimal(mutation.payload.get("UnitsToDeduct", "1")),
                 realized_pnl_usd=Decimal("5"),
             )
         if mutation.operation == "modify":

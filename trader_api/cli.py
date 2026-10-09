@@ -24,6 +24,11 @@ def _parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init")
     init.add_argument("--expected-investment", required=True)
     init.add_argument("--currency", default="USD")
+    smoke = commands.add_parser("smoke-demo")
+    smoke.add_argument("--expected-investment", required=True)
+    smoke.add_argument("--symbol", default="ETH")
+    smoke.add_argument("--strategy-notional-usd", default="100")
+    smoke.add_argument("--reconcile", action="store_true")
     for name in ("audit", "history", "trends"):
         command = commands.add_parser(name)
         command.add_argument("--limit", type=int, default=100)
@@ -82,6 +87,10 @@ def _dispatch(service: TraderService, args: argparse.Namespace) -> Any:
         return direct[args.command]()
     if args.command == "init":
         return service.initialize(args.expected_investment, args.currency)
+    if args.command == "smoke-demo":
+        return service.smoke_demo(
+            args.expected_investment, args.symbol, args.strategy_notional_usd, reconcile=args.reconcile
+        )
     if args.command == "audit":
         return service.audit_events(limit=args.limit)
     if args.command == "history":
@@ -135,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if not trader_id:
                 raise TraderError("TRADER_MISMATCH", "--trader is required")
+            if args.command == "smoke-demo" and args.expected_environment != "demo":
+                raise TraderError("DEMO_ONLY", "smoke trading requires --expected-environment demo")
             service = TraderService(trader_id, args.config, args.expected_environment)
             environment = service.environment
             data = _dispatch(service, args)

@@ -69,3 +69,11 @@ def normalize_portfolio(
     if all(value is None for value in metrics.values()):
         raise TraderError("VALUATION_UNAVAILABLE", "portfolio response has no supported valuation metrics")
     return PortfolioObservation(storage_datetime(observed_at), **metrics, reasons=tuple(reasons))
+
+
+@dataclass(frozen=True, slots=True)
+class PriceQuote:
+    instrument_id: int
+    bid: Decimal
+    ask: Decimal
+    refreshed_at: datetime

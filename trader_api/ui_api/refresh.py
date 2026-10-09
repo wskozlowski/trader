@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import threading
-from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
+import dbzero as db0  # type: ignore[import-untyped]
+
 from ..auth import resolve_context
-from ..broker.observations import PortfolioObservation
+from ..broker.observations import PriceQuote
 from ..domain import ScopeEvidence, VerifiedContext
 from ..errors import TraderError
 from ..serialization import storage_datetime
-from ..storage import PortfolioBinding, RefreshState
+from ..storage import ExecutionState, Intent, PortfolioBinding, Position, PositionPrice, PositionState, RefreshState
 from .session import Session, selected
-from .updates import current, periods, record_valuation
+from .updates import current, periods
 
 
 class _StoredVerifier:
@@ -26,15 +28,26 @@ class _StoredVerifier:
         if record is None:
             return None
         return ScopeEvidence(
-            frozenset(record.scopes), record.subject_id, record.trading_account_id,
-            record.trading_portfolio_id, record.issued_at, record.expires_at, record.revoked, record.source,
+            frozenset(record.scopes),
+            record.subject_id,
+            record.trading_account_id,
+            record.trading_portfolio_id,
+            record.issued_at,
+            record.expires_at,
+            record.revoked,
+            record.source,
         )
 
 
 def validate_scope(session: Session, now: datetime) -> VerifiedContext:
+    if session._service.trading_mode == "standalone":
+        session._service._validate_binding()
+        return session._context
     context = resolve_context(
-        session._service.profile, _StoredVerifier(session),
-        expected_environment=session._context.environment, now=now,
+        session._service.profile,
+        _StoredVerifier(session),
+        expected_environment=session._context.environment,
+        now=now,
     )
     session._store.open(session._prefix)
     binding = PortfolioBinding()
@@ -91,10 +104,10 @@ class RefreshWorker:
             self.thread = threading.Thread(target=self._run, name="trader-ui-refresh", daemon=True)
             self.thread.start()
 
-    def request(self) -> None:
+    def request(self, *, execution_changed: bool = False) -> None:
         with self.condition:
             # Requests during one collection are satisfied by that collection.
-            if not self.refreshing:
+            if not self.refreshing or execution_changed:
                 self.queued = True
             self.condition.notify_all()
 
@@ -145,29 +158,61 @@ class RefreshWorker:
                 periods(current(now), now)
             with selected(session):
                 context = validate_scope(session, now)
-            reader = getattr(session._service.broker, "collect_portfolio", None)
-            if reader is None:
-                raise TraderError("VALUATION_UNAVAILABLE", "broker has no observational portfolio reader")
-            # Network I/O is outside all database critical sections.
-            observation = reader(context, now)
-            if not isinstance(observation, PortfolioObservation):
-                raise TraderError("VALUATION_UNAVAILABLE", "broker returned an unsupported observation")
-            at = storage_datetime(observation.observed_at)
+            with selected(session):
+                initialized = session._store.state(session._prefix, session.trader).initialized
+                pending = any(
+                    i.state in {ExecutionState.ADMITTED, ExecutionState.UNKNOWN, ExecutionState.ACKNOWLEDGED}
+                    for i in db0.find(Intent)
+                )
+            errors: list[Exception] = []
+            if initialized:
+                try:
+                    if pending:
+                        session._service.reconcile()
+                    session._service.refresh_execution_details()
+                except Exception as exc:
+                    errors.append(exc)
+            with selected(session):
+                positions = [(p, p.instrument_id) for p in db0.find(Position, PositionState.OPEN)]
+            reader = getattr(session._service.broker, "quote", None)
+            quotes: dict[int, PriceQuote] = {}
+            for instrument in {instrument for _, instrument in positions}:
+                try:
+                    if reader is None:
+                        raise TraderError("VALUATION_UNAVAILABLE", "broker has no price reader")
+                    quote = reader(context, instrument, storage_datetime(session._clock()))
+                    finished = storage_datetime(session._clock())
+                    if (
+                        not isinstance(quote, PriceQuote)
+                        or quote.instrument_id != instrument
+                        or quote.refreshed_at > finished
+                        or quote.refreshed_at < now - timedelta(seconds=90)
+                        or any(not isinstance(v, Decimal) or not v.is_finite() for v in (quote.bid, quote.ask))
+                        or quote.bid <= 0
+                        or quote.ask < quote.bid
+                    ):
+                        raise TraderError("VALUATION_UNAVAILABLE", "broker returned an invalid quote")
+                    quotes[instrument] = quote
+                except Exception as exc:
+                    errors.append(exc)
             finished = storage_datetime(session._clock())
-            if at > finished or at < now - timedelta(seconds=120):
-                raise TraderError("VALUATION_UNAVAILABLE", "broker observation timestamp is invalid")
-            for amount in (observation.equity, observation.cash, observation.unrealized_pnl, observation.exposure):
-                if amount is not None and (not isinstance(amount, Decimal) or not amount.is_finite()):
-                    raise TraderError("VALUATION_UNAVAILABLE", "broker observation metric is invalid")
-            missing = tuple(f"missing_{name}" for name in ("equity", "cash", "unrealized_pnl", "exposure")
-                            if getattr(observation, name) is None)
-            if len(missing) == 4:
-                raise TraderError("VALUATION_UNAVAILABLE", "broker observation has no supported metrics")
-            observation = replace(observation, observed_at=at,
-                                  reasons=tuple(dict.fromkeys((*observation.reasons, *missing))))
             with selected(session, write=True):
                 validate_scope(session, finished)
-                record_valuation(observation)
+                for position, instrument in positions:
+                    quote = quotes.get(instrument)
+                    if quote is None or position.state != PositionState.OPEN:
+                        continue
+                    cached = next(iter(db0.find(PositionPrice, db0.as_tag(position))), None)
+                    if cached is None:
+                        cached = PositionPrice(position, quote.bid, quote.ask, storage_datetime(quote.refreshed_at))
+                        db0.tags(cached).add("POSITION_PRICE")
+                    elif quote.refreshed_at >= cached.refreshed_at:
+                        cached.bid, cached.ask = quote.bid, quote.ask
+                        cached.refreshed_at = storage_datetime(quote.refreshed_at)
+                current(finished).generation += 1
+            if errors:
+                raise errors[0]
+            with selected(session, write=True):
                 state = RefreshState()
                 state.last_success = finished
                 state.in_progress = False
@@ -177,6 +222,7 @@ class RefreshWorker:
                 state.next_attempt = self.due
                 self.retry_not_before = None
         except Exception as exc:
+            logging.getLogger(__name__).exception("Portfolio refresh failed for trader %s", session._service.trader_id)
             finished = storage_datetime(session._clock())
             with selected(session, write=True):
                 state = RefreshState()
@@ -184,9 +230,15 @@ class RefreshWorker:
                 state.failures += 1
                 # Never persist arbitrary broker/exception text or response bodies.
                 allowed = {
-                    "BROKER_RATE_LIMITED", "BROKER_UNAVAILABLE", "BROKER_OUTCOME_UNKNOWN",
-                    "VALUATION_UNAVAILABLE", "ACCOUNT_MISMATCH", "PERMISSION_REVOKED",
-                    "PORTFOLIO_SCOPE_MISMATCH", "ENVIRONMENT_UNVERIFIED", "CONFIG_INVALID",
+                    "BROKER_RATE_LIMITED",
+                    "BROKER_UNAVAILABLE",
+                    "BROKER_OUTCOME_UNKNOWN",
+                    "VALUATION_UNAVAILABLE",
+                    "ACCOUNT_MISMATCH",
+                    "PERMISSION_REVOKED",
+                    "PORTFOLIO_SCOPE_MISMATCH",
+                    "ENVIRONMENT_UNVERIFIED",
+                    "CONFIG_INVALID",
                 }
                 state.error = exc.code if isinstance(exc, TraderError) and exc.code in allowed else "REFRESH_FAILED"
                 delay = min(300, 60 * 2 ** min(state.failures - 1, 3))

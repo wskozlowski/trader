@@ -1,16 +1,17 @@
 # Agentic trader service
 
 This package implements the isolated trader contract in `designs/trader-api-design.md`. It never
-turns a locally entered balance into broker money. An owner administrator first registers a verified
-Agent Portfolio binding, child-token scope evidence, owner mirror, and separate accounting baselines.
-Strategy fills and owner-mirror fills are reconciled independently.
+turns a locally entered balance into broker money. Bound traders use an owner-registered Agent
+Portfolio and copy mirror. Explicit standalone traders execute directly in the credential's broker
+account, with a virtual strategy-only cap and no owner mirror.
 
 ## Setup
 
-The pinned local dbzero-pro build requires Python 3.13.
+The local dbzero 0.6.6 wheel is installed from `/dbzero-data/lib` and requires
+regular CPython 3.14 (`3.14+gil` in uv).
 
 ```bash
-uv sync --all-extras --python /usr/bin/python3.13
+uv sync --all-extras --python 3.14+gil
 chmod 600 .env_demo
 .venv/bin/trader --help
 .venv/bin/trader-admin --help
@@ -19,6 +20,24 @@ chmod 600 .env_demo
 Profiles are fixed project-root filenames and are never merged with ambient variables. Remove the
 obsolete `TRADER_ENV`; only broker/owner-verified scopes establish an environment. The committed
 `.env_demo.example` contains supported full demo URLs. Never commit an actual profile.
+
+For direct demo trading, explicitly set `TRADER_TRADING_MODE=standalone` in a mode-0600 profile,
+use direct-account credentials, and configure identity/P&L, eligibility, quote, cost, and execution
+routes for the same environment. Startup authenticates the broker read, binds ordinary-account identity
+to a one-way fingerprint of the authenticated user key (or explicit broker IDs when returned), and probes
+ETH eligibility before any command is enabled. No Agent Portfolio or copy relationship is created. Broker write access
+remains authoritative at dispatch; a successful read does not guarantee that an order will be accepted.
+The `init` amount is strategy capital only, not a broker deposit. No agent binding or copy is created.
+
+```bash
+trader --config .env_demo --trader alpha --expected-environment demo \
+  smoke-demo --expected-investment 1000 --symbol ETH --strategy-notional-usd 100
+```
+
+Repeating the same smoke command reports its durable outcome without a second broker dispatch.
+If it reports an unknown or pending execution, explicitly repeat with `--reconcile` to look up the
+same order; do not place a replacement trade. The smoke command refuses REAL and bound profiles.
+REAL standalone accounts require an explicit profile and catalog opt-in; there is no automatic smoke.
 
 ## Provisioning and worker isolation
 
@@ -105,3 +124,59 @@ The external demo suite is opt-in. It uses dedicated portfolios, no more than US
 investment, leverage one, and the smallest eligible size. Missing owner/child binding evidence is a
 blocked test, not a pass. Every external resource is tracked; ambiguous mutations are never blindly
 retried and portfolio deletion requires separate explicit authorization.
+
+## Web UI
+
+Run `./start_ui.sh` and open `http://localhost:8001`. The launcher syncs the UI dependencies,
+including the local dbzero wheel, into the project environment.
+
+The UI uses NiceGUI 3.18.0, which removes the older `vbuild` dependency incompatible
+with Python 3.14. Trader initialization and dashboard reads run in worker threads so dbzero transactions stay outside NiceGUI asyncio tasks.
+Startup, dashboard, and background portfolio refresh errors print to the server console
+with tracebacks; the browser displays a stable error code.
+
+The browser regression test uses an isolated database and simulated broker without external
+trading. Install `playwright` with `uv pip install --python .venv/bin/python playwright` and run `.venv/bin/python -m playwright install chromium`,
+then `.venv/bin/python -m pytest tests/test_web_ui.py`. NiceGUI must also be installed.
+
+The workspace shows only the selected trader’s durable local positions, pending orders,
+and execution history. Account cash, external positions, and old account-wide valuation
+snapshots do not enter its dashboard. **Allocated capital** is strategy capital, not a
+broker deposit; **Available strategy budget** follows the existing admission rules.
+Uninitialized traders can initialize their allocation in the workspace.
+
+Open orders default to market and leverage one. Market-if-touched and limit IOC are
+available when supported by the configured broker. Review the trader, environment,
+instrument, size, estimated costs, and budget impact before submitting. Positions
+support full or partial closing (default 100%); owned pending orders support cancellation
+when the corresponding broker route is configured. Editing a draft or switching workspaces
+invalidates its review. Repeated submission uses the same idempotency key. Pending or
+unknown executions are reconciled through their existing records, without replacement
+orders, and dispatched work continues if the browser disconnects.
+
+P/L uses confirmed fills and costs. Realized P/L is gross confirmed close profit minus
+confirmed execution costs, including opening fees once. Unrealized P/L uses remaining
+confirmed units and bid for longs or ask for shorts; leverage is not applied again.
+Missing required execution, cost, or price data displays **Waiting**. An initialized
+trader with no executions has an empty portfolio and zero P/L.
+
+Prices refresh every 60 seconds, after execution changes, and on manual request (subject
+to broker retry backoff). Cached prices survive errors and restarts. Each position shows
+its last successful quote timestamp; it turns red only after 90 seconds. Aggregate P/L
+uses the oldest contributing price timestamp. Reloading the page does not refresh that
+timestamp. Confirmed fills and prices use separate persisted records, preserving existing
+databases; execution backfill looks up only locally recorded orders.
+
+Commands serialize per trader, with broker I/O outside database critical sections.
+Persistent model classes use empty Python slots to avoid inheriting managed instance
+dictionaries and weakrefs into dbzero's native memory layout on CPython 3.14. This
+preserves stored fields and existing databases. Database critical sections also defer
+automatic cyclic garbage collection while the pinned native extension releases the GIL,
+restoring the previous GC setting immediately afterward. Trading tests use simulated brokers, including two traders sharing an account and
+unrelated external positions.
+
+Validation limitation: the separate `test_dbzero_repro.py` repeated close/reopen test
+still reproduces an intermittent segmentation fault inside dbzero 0.6.6, including
+native Decimal decoding. The model-layout and GC safeguards above are mitigations,
+not a complete fix for that dependency defect. The standard non-external suite and
+browser scenarios have passed, but native restart stability remains unresolved.

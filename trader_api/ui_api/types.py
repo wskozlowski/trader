@@ -75,6 +75,9 @@ class Valuation:
     unrealized_pnl: Decimal | None
     exposure: Decimal | None
     reasons: tuple[str, ...]
+    realized_pnl: Decimal | None = None
+    total_pnl: Decimal | None = None
+    price_stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,8 @@ class Dashboard:
     valuation: Valuation
     operation_counts: dict[str, int]
     refresh: RefreshStatus
+    trading_mode: str = "bound"
+    direct_account_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +155,12 @@ class PositionView:
     units: Decimal
     stop_loss_rate: Decimal | None
     take_profit_rate: Decimal | None
+    entry_price: Decimal | None = None
+    liquidation_price: Decimal | None = None
+    remaining_units: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    price_refreshed_at: datetime | None = None
+    price_stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +174,7 @@ class OrderView:
     created_at: datetime
     symbol: str
     state: ExecutionState
+    operation: Operation | None = None
 
 
 @dataclass(frozen=True, slots=True)

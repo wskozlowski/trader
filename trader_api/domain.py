@@ -155,6 +155,7 @@ class BrokerOutcome:
     actual_cost_usd: Decimal | None = None
     realized_pnl_usd: Decimal | None = None
     raw_fingerprint: str | None = None
+    execution_price: Decimal | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: str(value) if isinstance(value, Decimal) else value for key, value in asdict(self).items()}

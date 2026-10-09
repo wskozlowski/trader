@@ -19,6 +19,7 @@ import dbzero as db0  # type: ignore[import-untyped]
 
 from ..domain import Budget, utc_now
 from ..errors import TraderError
+from ..portfolio import position_value, totals
 from ..serialization import native_copy
 from ..storage import (
     AccountingObservation,
@@ -84,9 +85,16 @@ def open_session(service: TraderService, *, clock: Callable[[], datetime] = utc_
         state = service.store.one(TraderState, prefix=captured)
         binding = service.store.one(PortfolioBinding, prefix=captured)
         context = service._context
-        if (
-            state is None or binding is None or not binding.binding_version
-            or state.trader != service.trader or binding.trader != service.trader
+        if service.trading_mode == "standalone":
+            service._validate_binding()
+            if state is None or not context.can_read:
+                raise TraderError("DIRECT_ACCOUNT_IDENTITY_UNVERIFIED", "direct account read is unavailable")
+        elif (
+            state is None
+            or binding is None
+            or not binding.binding_version
+            or state.trader != service.trader
+            or binding.trader != service.trader
             or binding.environment != state.environment
             or str(state.environment).lower() != context.environment.value
             or binding.agent_trading_account_id != context.trading_account_id
@@ -111,17 +119,22 @@ def _refresh_status(session: Session) -> RefreshStatus:
     assert worker is not None
     with worker.condition:
         running, refreshing, queued = worker.running, worker.refreshing, worker.queued
-    stale = state.last_success is None or (utc(session._clock()) - state.last_success).total_seconds() > 120
+    stale = state.last_success is None or (utc(session._clock()) - state.last_success).total_seconds() > 90
     return RefreshStatus(
-        running, refreshing, queued, state.last_attempt, state.last_success,
+        running,
+        refreshing,
+        queued,
+        state.last_attempt,
+        state.last_success,
         state.next_attempt if running else None,
         "REFRESH_INTERRUPTED" if state.in_progress and not running else state.error,
-        summary.generation, stale,
+        summary.generation,
+        stale,
     )
 
 
 def get_refresh_status(session: Session) -> RefreshStatus:
-    """Return scheduler state, sanitized error, generation and 120-second freshness.
+    """Return scheduler state, sanitized error, generation and 90-second freshness.
 
     `session` fixes the trader scope. This local read has no side effects or
     ordering; no successful collection means stale. Raises SESSION_CLOSED if the
@@ -171,23 +184,41 @@ def request_refresh(session: Session) -> RefreshStatus:
 def get_dashboard(session: Session) -> Dashboard:
     """Return this trader's current lifecycle, budgets, valuation, counts and freshness.
 
-    Owner allocation and risk budgets are separate from strategy equity. Values
-    and counts are detached at the last committed generation; no history scans,
-    network calls, sorting or writes occur. Missing broker metrics remain None.
+    Valuation uses only confirmed local fills, costs, and cached liquidation
+    prices. Legacy account-wide snapshots are excluded. Values are detached under
+    the database lock, without network calls. Missing required data remains None.
     `session` fixes scope; a closed database raises SESSION_CLOSED.
     """
     with selected(session):
         state = session._store.state(session._prefix, session.trader)
         binding = session._store.binding(session._prefix)
+        standalone = session._service.trading_mode == "standalone"
         summary = current(utc(session._clock()))
+        realized, unrealized, price_at = totals(state.initialized)
+        total = None if realized is None or unrealized is None else realized + unrealized
         return Dashboard(
-            session.trader, binding.lifecycle, state.initialized, state.currency,
+            session.trader,
+            session._service._direct().lifecycle if standalone else binding.lifecycle,
+            state.initialized,
+            state.currency,
             Budget(state.strategy_initial_cap, state.strategy_realized, state.strategy_committed),
             Budget(state.owner_initial_cap, state.owner_realized, state.owner_committed),
-            binding.investment_usd,
-            Valuation(summary.last_observed_at, summary.equity, summary.cash, summary.unrealized_pnl,
-                      summary.exposure, tuple(summary.reasons)),
-            dict(summary.operation_counts), _refresh_status(session),
+            state.owner_initial_cap if standalone else binding.investment_usd,
+            Valuation(
+                price_at,
+                None if total is None else state.strategy_initial_cap + total,
+                None,
+                unrealized,
+                None,
+                ("waiting_for_confirmed_data",) if total is None else (),
+                realized,
+                total,
+                price_at is not None and (session._clock() - price_at).total_seconds() > 90,
+            ),
+            dict(summary.operation_counts),
+            _refresh_status(session),
+            session._service.trading_mode,
+            standalone,
         )
 
 
@@ -209,9 +240,26 @@ def get_statistics(session: Session, period: Period = Period.TODAY) -> Statistic
         refresh = _refresh_status(session)
         if item is None:
             return Statistics(
-                period, start, summary.started_at, None, None, None, None, None, None,
-                None, None, None, None, None, 0, 0, ("period_not_collected",), {},
-                summary.generation, refresh.stale,
+                period,
+                start,
+                summary.started_at,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                ("period_not_collected",),
+                {},
+                summary.generation,
+                refresh.stale,
             )
         change = None if item.first_equity is None or item.last_equity is None else item.last_equity - item.first_equity
         reasons = list(item.reasons)
@@ -228,26 +276,64 @@ def get_statistics(session: Session, period: Period = Period.TODAY) -> Statistic
         if refresh.stale:
             reasons.append("stale")
         return Statistics(
-            period, start, summary.started_at, item.first_observed_at, item.last_observed_at,
-            item.last_equity, item.cash, item.unrealized_pnl, item.exposure, item.realized_pnl, item.costs,
-            change, item.max_equity, item.max_drawdown, item.sample_count, item.missing_intervals,
-            tuple(reasons), dict(item.operation_counts), summary.generation, refresh.stale,
+            period,
+            start,
+            summary.started_at,
+            item.first_observed_at,
+            item.last_observed_at,
+            item.last_equity,
+            item.cash,
+            item.unrealized_pnl,
+            item.exposure,
+            item.realized_pnl,
+            item.costs,
+            change,
+            item.max_equity,
+            item.max_drawdown,
+            item.sample_count,
+            item.missing_intervals,
+            tuple(reasons),
+            dict(item.operation_counts),
+            summary.generation,
+            refresh.stale,
         )
 
 
 def _operation(item: Intent) -> OperationView:
     return OperationView(
-        item, item.sequence, item.created_at, item.operation, item.state, native_copy(item.params),
-        item.error_code, item.broker_order_id, item.broker_position_id,
+        item,
+        item.sequence,
+        item.created_at,
+        item.operation,
+        item.state,
+        native_copy(item.params),
+        item.error_code,
+        item.broker_order_id,
+        item.broker_position_id,
     )
 
 
-def _position(item: Position) -> PositionView:
-    return PositionView(item, **{f.name: native_copy(getattr(item, f.name)) for f in fields(PositionView)[1:]})
+def _position(item: Position, now: datetime | None = None) -> PositionView:
+    value = position_value(item)
+    return PositionView(
+        item,
+        **{f.name: native_copy(getattr(item, f.name)) for f in fields(PositionView)[1:14]},
+        entry_price=value.entry_price,
+        liquidation_price=value.liquidation_price,
+        remaining_units=value.remaining_units,
+        unrealized_pnl=value.unrealized_pnl,
+        price_refreshed_at=value.price_refreshed_at,
+        price_stale=value.price_refreshed_at is not None
+        and ((now or utc_now()) - value.price_refreshed_at).total_seconds() > 90,
+    )
 
 
 def _order(item: Order) -> OrderView:
-    return OrderView(item, **{f.name: native_copy(getattr(item, f.name)) for f in fields(OrderView)[1:]})
+    return OrderView(
+        item,
+        **{f.name: native_copy(getattr(item, f.name)) for f in fields(OrderView)[1:-1]},
+        operation=item.intent.operation,
+    )
 
 
 def _audit(item: AuditEvent) -> AuditView:
@@ -259,8 +345,14 @@ def _accounting(item: AccountingObservation) -> AccountingView:
 
 
 def list_operations(
-    session: Session, *, operation: Operation | None = None, state: ExecutionState | None = None,
-    start: datetime | None = None, end: datetime | None = None, limit: int = 100, cursor: Cursor | None = None,
+    session: Session,
+    *,
+    operation: Operation | None = None,
+    state: ExecutionState | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 100,
+    cursor: Cursor | None = None,
 ) -> Page[OperationView]:
     """Return local operations filtered by operation/state and creation time [start,end).
 
@@ -271,8 +363,16 @@ def list_operations(
     INVALID_CURSOR or SESSION_CLOSED. Values are detached at read time.
     """
     with selected(session):
-        return page(session, Intent, _operation, tags=tuple(x for x in (operation, state) if x is not None),
-                    start=start, end=end, limit=limit, cursor=cursor)
+        return page(
+            session,
+            Intent,
+            _operation,
+            tags=tuple(x for x in (operation, state) if x is not None),
+            start=start,
+            end=end,
+            limit=limit,
+            cursor=cursor,
+        )
 
 
 def _intent_tags(session: Session, intent: Intent | None, *tags: object | None) -> tuple[object, ...]:
@@ -284,9 +384,14 @@ def _intent_tags(session: Session, intent: Intent | None, *tags: object | None) 
 
 
 def list_positions(
-    session: Session, *, state: PositionState | None = None, symbol: str | None = None,
+    session: Session,
+    *,
+    state: PositionState | None = None,
+    symbol: str | None = None,
     # Persistent local Intent handle, not a broker ID or UUID string.
-    intent: Intent | None = None, limit: int = 100, cursor: Cursor | None = None,
+    intent: Intent | None = None,
+    limit: int = 100,
+    cursor: Cursor | None = None,
 ) -> Page[PositionView]:
     """Return indexed local positions for state/symbol/intent, ascending creation sequence.
 
@@ -297,15 +402,25 @@ def list_positions(
     INVALID_PAGE_SIZE/INVALID_CURSOR, or SESSION_CLOSED.
     """
     with selected(session):
-        return page(session, Position, _position,
-                    tags=_intent_tags(session, intent, state, None if symbol is None else f"symbol:{symbol}"),
-                    limit=limit, cursor=cursor)
+        return page(
+            session,
+            Position,
+            lambda item: _position(item, session._clock()),
+            tags=_intent_tags(session, intent, state, None if symbol is None else f"symbol:{symbol}"),
+            limit=limit,
+            cursor=cursor,
+        )
 
 
 def list_orders(
-    session: Session, *, state: ExecutionState | None = None, symbol: str | None = None,
+    session: Session,
+    *,
+    state: ExecutionState | None = None,
+    symbol: str | None = None,
     # Persistent local Intent handle, not a broker ID or UUID string.
-    intent: Intent | None = None, limit: int = 100, cursor: Cursor | None = None,
+    intent: Intent | None = None,
+    limit: int = 100,
+    cursor: Cursor | None = None,
 ) -> Page[OrderView]:
     """Return indexed local orders for state/symbol/intent, ascending creation sequence.
 
@@ -316,16 +431,28 @@ def list_orders(
     INVALID_PAGE_SIZE/INVALID_CURSOR, or SESSION_CLOSED.
     """
     with selected(session):
-        return page(session, Order, _order,
-                    tags=_intent_tags(session, intent, state, None if symbol is None else f"symbol:{symbol}"),
-                    limit=limit, cursor=cursor)
+        return page(
+            session,
+            Order,
+            _order,
+            tags=_intent_tags(session, intent, state, None if symbol is None else f"symbol:{symbol}"),
+            limit=limit,
+            cursor=cursor,
+        )
 
 
 def list_audit_events(
-    session: Session, *, start: datetime | None = None, end: datetime | None = None,
-    kind: str | None = None, actor: str | None = None, source: str | None = None,
+    session: Session,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    kind: str | None = None,
+    actor: str | None = None,
+    source: str | None = None,
     # Persistent local Intent handle associated with the audit record.
-    intent: Intent | None = None, limit: int = 100, cursor: Cursor | None = None,
+    intent: Intent | None = None,
+    limit: int = 100,
+    cursor: Cursor | None = None,
 ) -> Page[AuditView]:
     """Return immutable audit records by time [start,end), kind, actor, source and intent.
 
@@ -336,17 +463,34 @@ def list_audit_events(
     INVALID_HANDLE/TRADER_MISMATCH for foreign intent, or SESSION_CLOSED.
     """
     with selected(session):
-        tags = tuple(f"{key}:{value}" for key, value in (("kind", kind), ("actor", actor), ("source", source))
-                     if value is not None)
-        return page(session, AuditEvent, _audit, tags=_intent_tags(session, intent, *tags),
-                    start=start, end=end, time_field="occurred_at", limit=limit, cursor=cursor)
+        tags = tuple(
+            f"{key}:{value}"
+            for key, value in (("kind", kind), ("actor", actor), ("source", source))
+            if value is not None
+        )
+        return page(
+            session,
+            AuditEvent,
+            _audit,
+            tags=_intent_tags(session, intent, *tags),
+            start=start,
+            end=end,
+            time_field="occurred_at",
+            limit=limit,
+            cursor=cursor,
+        )
 
 
 def list_accounting_observations(
-    session: Session, *, start: datetime | None = None, end: datetime | None = None,
+    session: Session,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
     kind: str | None = None,
     # Persistent local Intent handle for the reported accounting contribution.
-    intent: Intent | None = None, limit: int = 100, cursor: Cursor | None = None,
+    intent: Intent | None = None,
+    limit: int = 100,
+    cursor: Cursor | None = None,
 ) -> Page[AccountingView]:
     """Return estimates, confirmed contributions and transitions by ascending sequence.
 
@@ -357,8 +501,17 @@ def list_accounting_observations(
     Raises INVALID_RANGE/PAGE_SIZE/CURSOR, INVALID_HANDLE/TRADER_MISMATCH or SESSION_CLOSED.
     """
     with selected(session):
-        return page(session, AccountingObservation, _accounting, tags=_intent_tags(session, intent, kind),
-                    start=start, end=end, time_field="occurred_at", limit=limit, cursor=cursor)
+        return page(
+            session,
+            AccountingObservation,
+            _accounting,
+            tags=_intent_tags(session, intent, kind),
+            start=start,
+            end=end,
+            time_field="occurred_at",
+            limit=limit,
+            cursor=cursor,
+        )
 
 
 def get_operation(
@@ -377,13 +530,19 @@ def get_operation(
     with selected(session):
         check_handle(session, intent, Intent)
         return OperationDetail(
-            _operation(intent), list_orders(session, intent=intent),
-            list_positions(session, intent=intent), list_accounting_observations(session, intent=intent),
+            _operation(intent),
+            list_orders(session, intent=intent),
+            list_positions(session, intent=intent),
+            list_accounting_observations(session, intent=intent),
         )
 
 
 def get_portfolio_chart(
-    session: Session, start: datetime, end: datetime, *, resolution: Resolution | None = None,
+    session: Session,
+    start: datetime,
+    end: datetime,
+    *,
+    resolution: Resolution | None = None,
 ) -> PortfolioChart:
     """Read at most 1,000 stored valuation buckets intersecting UTC [start,end).
 

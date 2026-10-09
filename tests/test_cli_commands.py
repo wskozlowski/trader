@@ -56,6 +56,20 @@ class FakeService:
             "submit",
         ),
         (["trade", "status", "--intent-id", "intent"], "intent_status"),
+        (
+            [
+                "--expected-environment",
+                "demo",
+                "smoke-demo",
+                "--expected-investment",
+                "1000",
+                "--symbol",
+                "ETH",
+                "--strategy-notional-usd",
+                "100",
+            ],
+            "smoke_demo",
+        ),
     ],
 )
 def test_cli_routes_every_public_command(
@@ -76,3 +90,14 @@ def test_cli_version_and_missing_trader(capsys: pytest.CaptureFixture[str]) -> N
     assert json.loads(capsys.readouterr().out)["data"]["version"] == cli.VERSION
     assert cli.main(["status", "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "TRADER_MISMATCH"
+
+
+def test_smoke_refuses_real_before_any_broker_access(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "TraderService", lambda *_args, **_kwargs: pytest.fail("broker was accessed"))
+    assert (
+        cli.main(["--trader", "alpha", "--expected-environment", "real", "smoke-demo", "--expected-investment", "1000"])
+        == 1
+    )
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "DEMO_ONLY"

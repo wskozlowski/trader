@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import threading
 import uuid
@@ -19,6 +20,9 @@ from .errors import TraderError
 from .serialization import canonical_json, native_copy, storage_datetime
 
 T = TypeVar("T")
+
+# dbzero supplies dynamic native attributes; the Python base allocates no slots.
+_NATIVE_SLOTS: tuple[str, ...] = ()
 
 
 @db0.enum(values=["DEMO", "REAL"])
@@ -123,6 +127,8 @@ class EntityType:
 @db0.tag_fields("name")
 @dataclass(eq=False)
 class Trader:
+    __slots__ = _NATIVE_SLOTS
+
     name: str
 
 
@@ -130,6 +136,8 @@ class Trader:
 @db0.tag_fields("trader")
 @dataclass(eq=False)
 class TraderState:
+    __slots__ = _NATIVE_SLOTS
+
     trader: Trader
     environment: Environment
     initialized: bool = field(default=False, kw_only=True)
@@ -149,6 +157,8 @@ class TraderState:
 @db0.tag_fields("trader")
 @dataclass(eq=False)
 class PortfolioBinding:
+    __slots__ = _NATIVE_SLOTS
+
     environment: Environment | None = field(default=None, kw_only=True)
     trader: Trader | None = field(default=None, kw_only=True)
     # Supplied owner identity; eToro adapter uses credential:<fingerprint>, not an account ID.
@@ -173,10 +183,27 @@ class PortfolioBinding:
     verified_at: datetime | None = field(default=None, kw_only=True)
 
 
+@db0.memo(singleton=True)
+@dataclass(eq=False)
+class DirectAccount:
+    __slots__ = _NATIVE_SLOTS
+
+    # Separate from owner-issued agent portfolio identity and copy relationship.
+    account_id: str = field(default="", kw_only=True)
+    portfolio_id: str = field(default="", kw_only=True)
+    credential_fingerprint: str = field(default="", kw_only=True)
+    identity_source: str = field(default="", kw_only=True)
+    environment: Environment | None = field(default=None, kw_only=True)
+    lifecycle: Lifecycle = field(default=Lifecycle.UNBOUND, kw_only=True)
+    verified_at: datetime | None = field(default=None, kw_only=True)
+
+
 @db0.memo
 @db0.tag_fields("operation")
 @dataclass(eq=False)
 class Preview:
+    __slots__ = _NATIVE_SLOTS
+
     operation: Operation
     # External eToro instrument_id (int), position_id/order_id (numeric text), and market symbol.
     params: dict[str, Any]
@@ -192,6 +219,8 @@ class Preview:
 @db0.tag_fields("preview", "request_id", "operation", "state")
 @dataclass(eq=False)
 class Intent:
+    __slots__ = _NATIVE_SLOTS
+
     preview: Preview
     # Caller-supplied key for local submission deduplication, not a broker or memo ID.
     idempotency_key: str
@@ -218,6 +247,8 @@ class Intent:
 @db0.tag_fields("intent")
 @dataclass(eq=False)
 class Reservation:
+    __slots__ = _NATIVE_SLOTS
+
     intent: Intent
     strategy_amount_usd: Decimal
     owner_amount_usd: Decimal
@@ -231,6 +262,8 @@ class Reservation:
 @db0.tag_fields("intent", "position_id", "state", "symbol", "symbol_filter")
 @dataclass(eq=False)
 class Position:
+    __slots__ = _NATIVE_SLOTS
+
     # External eToro numeric positionId/positionID as text for broker operations; not a memo ID.
     position_id: str
     intent: Intent
@@ -258,6 +291,8 @@ class Position:
 @db0.tag_fields("intent", "order_id", "state", "symbol", "symbol_filter")
 @dataclass(eq=False)
 class Order:
+    __slots__ = _NATIVE_SLOTS
+
     # External eToro numeric orderId/orderID as text for lookup/cancellation; not a memo ID.
     order_id: str
     intent: Intent
@@ -272,8 +307,47 @@ class Order:
         self.symbol_filter = f"symbol:{self.symbol}"
 
 
+@db0.memo(singleton=True)
+@dataclass(eq=False)
+class LocalAccountingVersion:
+    __slots__ = _NATIVE_SLOTS
+
+    initialized: bool = False
+
+
+@db0.memo
+@db0.tag_fields("intent")
+@dataclass(eq=False)
+class ExecutionFill:
+    __slots__ = _NATIVE_SLOTS
+
+    """Confirmed execution facts, separate from legacy position schemas and estimates."""
+
+    intent: Intent
+    units: Decimal | None = None
+    price: Decimal | None = None
+    costs: Decimal | None = None
+    gross_pnl: Decimal | None = None
+    budget_net: Decimal = Decimal("0")
+    cost_reservation_released: bool = False
+
+
+@db0.memo
+@db0.tag_fields("position")
+@dataclass(eq=False)
+class PositionPrice:
+    __slots__ = _NATIVE_SLOTS
+
+    position: Position
+    bid: Decimal
+    ask: Decimal
+    refreshed_at: datetime
+
+
 @dataclass(eq=False)
 class BaseEvent:
+    __slots__ = _NATIVE_SLOTS
+
     sequence: int
     occurred_at: datetime
     kind: str
@@ -287,6 +361,8 @@ class BaseEvent:
 @db0.tag_fields("intent", "kind", "actor", "source", "kind_filter", "actor_filter", "source_filter")
 @dataclass(eq=False)
 class AuditEvent(BaseEvent):
+    __slots__ = _NATIVE_SLOTS
+
     actor: str
     intent: Intent | None
     source: str
@@ -304,6 +380,8 @@ class AuditEvent(BaseEvent):
 @db0.tag_fields("intent", "domain")
 @dataclass(eq=False)
 class LedgerEntry:
+    __slots__ = _NATIVE_SLOTS
+
     domain: LedgerDomain
     kind: LedgerKind
     amount_usd: Decimal
@@ -315,6 +393,8 @@ class LedgerEntry:
 @db0.tag_fields("trader")
 @dataclass(eq=False)
 class TraderRegistration:
+    __slots__ = _NATIVE_SLOTS
+
     trader_hash: str
     trader: Trader
     storage_key: str
@@ -325,6 +405,8 @@ class TraderRegistration:
 @db0.memo
 @dataclass(eq=False)
 class ControlReservation:
+    __slots__ = _NATIVE_SLOTS
+
     command_digest: str
     storage_key: str
     # Intent's locally generated broker correlation UUID sent as x-request-id; not a memo ID.
@@ -338,6 +420,8 @@ class ControlReservation:
 @db0.memo
 @dataclass(eq=False)
 class ProvisioningIntent:
+    __slots__ = _NATIVE_SLOTS
+
     request_key_digest: str
     # Locally generated correlation UUID sent to eToro as x-request-id; not a memo ID.
     request_id: str
@@ -356,6 +440,8 @@ class ProvisioningIntent:
 @db0.memo(immutable=True)
 @dataclass(eq=False)
 class OwnershipClaim:
+    __slots__ = _NATIVE_SLOTS
+
     scoped_key_digest: str
     storage_key: str
     entity_type: EntityType
@@ -366,6 +452,8 @@ class OwnershipClaim:
 @db0.memo
 @dataclass(eq=False)
 class TokenVerification:
+    __slots__ = _NATIVE_SLOTS
+
     credential_fingerprint: str
     scopes: list[str]
     # Broker credential subject from scope evidence; owner issuance uses the agent GCID.
@@ -383,6 +471,8 @@ class TokenVerification:
 @db0.memo(singleton=True)
 @dataclass(eq=False)
 class ControlState:
+    __slots__ = _NATIVE_SLOTS
+
     audit_sequence: int = field(default=0, kw_only=True)
     audit_head: str = field(default="0" * 64, kw_only=True)
 
@@ -391,12 +481,16 @@ class ControlState:
 @db0.indexed_fields("sequence", "occurred_at")
 @dataclass(eq=False)
 class ControlEvent(BaseEvent):
+    __slots__ = _NATIVE_SLOTS
+
     pass
 
 
 @db0.memo(singleton=True)
 @dataclass(eq=False)
 class UiSequence:
+    __slots__ = _NATIVE_SLOTS
+
     value: int = 0
 
 
@@ -409,6 +503,8 @@ def next_sequence() -> int:
 @db0.memo(singleton=True)
 @dataclass(eq=False)
 class RefreshState:
+    __slots__ = _NATIVE_SLOTS
+
     last_attempt: datetime | None = None
     last_success: datetime | None = None
     next_attempt: datetime | None = None
@@ -420,6 +516,8 @@ class RefreshState:
 @db0.memo(singleton=True)
 @dataclass(eq=False)
 class CurrentSummary:
+    __slots__ = _NATIVE_SLOTS
+
     started_at: datetime
     generation: int = 0
     accounting_checkpoint: int = 0
@@ -440,6 +538,8 @@ class CurrentSummary:
 @db0.indexed_fields("sequence", "occurred_at")
 @dataclass(eq=False)
 class ValuationSnapshot:
+    __slots__ = _NATIVE_SLOTS
+
     sequence: int
     occurred_at: datetime
     equity: Decimal | None
@@ -455,6 +555,8 @@ class ValuationSnapshot:
 @db0.tag_fields("intent", "kind")
 @dataclass(eq=False)
 class AccountingObservation:
+    __slots__ = _NATIVE_SLOTS
+
     sequence: int
     occurred_at: datetime
     # Memo entity handle for the local operation, never a generated link.
@@ -470,6 +572,8 @@ class AccountingObservation:
 @db0.tag_fields("intent")
 @dataclass(eq=False)
 class OperationContribution:
+    __slots__ = _NATIVE_SLOTS
+
     # Local operation handle used as the processing checkpoint key.
     intent: Intent
     state: str | None = None
@@ -482,6 +586,8 @@ class OperationContribution:
 
 @dataclass(eq=False)
 class EquityAggregate:
+    __slots__ = _NATIVE_SLOTS
+
     first_equity: Decimal | None = field(default=None, kw_only=True)
     last_equity: Decimal | None = field(default=None, kw_only=True)
     min_equity: Decimal | None = field(default=None, kw_only=True)
@@ -503,6 +609,8 @@ class EquityAggregate:
 @db0.tag_fields("key", "period")
 @dataclass(eq=False)
 class PeriodSummary(EquityAggregate):
+    __slots__ = _NATIVE_SLOTS
+
     key: str
     period: str
     start: datetime
@@ -518,12 +626,44 @@ class PeriodSummary(EquityAggregate):
 @db0.tag_fields("key", "resolution")
 @dataclass(eq=False)
 class ChartBucket(EquityAggregate):
+    __slots__ = _NATIVE_SLOTS
+
     key: str
     resolution: str
     start: datetime
 
 
-_runtime_lock = threading.RLock()
+# Native memo wrappers store their fields in dbzero. Empty Python slots above
+# prevent inheriting managed dict/weakref layouts incompatible with that native
+# storage on CPython 3.14; persisted field names and schemas are unchanged.
+class _DatabaseLock:
+    """Serialize native access and defer cyclic GC while dbzero 0.6.6 releases the GIL.
+
+    This pinned extension can race GC traversal with native commit (see
+    test_dbzero_repro.py). Refcounting continues normally; automatic cyclic GC
+    resumes immediately after the outer critical section, including on errors.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._depth = 0
+        self._restore_gc = False
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+        if self._depth == 0:
+            self._restore_gc = gc.isenabled()
+            gc.disable()
+        self._depth += 1
+
+    def __exit__(self, *exc: object) -> None:
+        self._depth -= 1
+        if self._depth == 0 and self._restore_gc:
+            gc.enable()
+        self._lock.release()
+
+
+_runtime_lock = _DatabaseLock()
 _runtime_root: Path | None = None
 _runtime_epoch = object()
 
@@ -609,6 +749,12 @@ class DbzeroStore:
         if registration.trader.name != trader_id:
             raise TraderError("TRADER_MISMATCH", "authenticated trader identity mismatch")
         return registration
+
+    def one_registration_exists(self, trader_id: str) -> bool:
+        return (
+            self.one(TraderRegistration, f"trader:{self.trader_hash(trader_id)}", prefix=self.control_prefix)
+            is not None
+        )
 
     def trader_prefix(self, storage_key: str) -> str:
         try:

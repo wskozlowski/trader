@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
-from ..domain import BrokerMutation, BrokerOutcome, ScopeEvidence, VerifiedContext
+from ..domain import BrokerMutation, BrokerOutcome, Environment, ScopeEvidence, VerifiedContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +25,8 @@ class ScopeIdentityVerifier(Protocol):
 
 class BrokerAdapter(Protocol):
     def capabilities(self) -> dict[str, bool]: ...
+
+    def probe_direct(self, environment: Environment) -> dict[str, str]: ...
 
     def verify_identity(self, context: VerifiedContext) -> dict[str, str]: ...
 

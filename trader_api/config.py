@@ -110,6 +110,7 @@ class Profile:
     vault_master_key: str | None
     routes: MappingProxyType[str, Route]
     timeout_seconds: float
+    trading_mode: str = "bound"
 
     def route(self, name: str) -> Route | None:
         return self.routes.get(name)
@@ -186,6 +187,9 @@ def load_profile(config_profile: str | Path = ".env") -> Profile:
     user_key = values.get("ETORO_USER_KEY", "")
     if not api_key or not user_key:
         raise TraderError("CONFIG_INVALID", "selected profile lacks broker credentials")
+    trading_mode = values.get("TRADER_TRADING_MODE", "bound")
+    if trading_mode not in {"bound", "standalone"}:
+        raise TraderError("CONFIG_INVALID", "TRADER_TRADING_MODE must be bound or standalone")
     routes = {
         name: _validate_url(name, value) for name, value in values.items() if name in _ROUTES or name in _NEUTRAL_ROUTES
     }
@@ -207,6 +211,7 @@ def load_profile(config_profile: str | Path = ".env") -> Profile:
         vault_master_key=values.get("TRADER_VAULT_MASTER_KEY") or None,
         routes=MappingProxyType(routes),
         timeout_seconds=timeout,
+        trading_mode=trading_mode,
     )
 
 

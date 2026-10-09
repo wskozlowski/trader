@@ -7,29 +7,43 @@ from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
 import dbzero as db0  # type: ignore[import-untyped]
 
-from .accounting import admit_open, copied_notional
-from .auth import ControlScopeVerifier, ScopeVerifier, resolve_context
+from .accounting import admit_open
+from .auth import ControlScopeVerifier, ScopeVerifier, fingerprint, resolve_context
 from .broker import BrokerAdapter, EtoroBrokerAdapter
 from .broker.etoro import open_payload
-from .config import Profile, fixed_storage_root, load_profile
-from .domain import BrokerMutation, BrokerOutcome, Budget, IntentState, money, utc_now
+from .config import Profile, fixed_storage_root, load_profile, route_environment
+from .domain import (
+    BrokerMutation,
+    BrokerOutcome,
+    Budget,
+    Environment,
+    IntentState,
+    VerifiedContext,
+    money,
+    reserve_money,
+    utc_now,
+)
 from .errors import TraderError
+from .portfolio import fill_for, initialize_accounting, position_value, record_fill
 from .serialization import api_value, canonical_json, native_copy, storage_datetime
 from .storage import (
     AuditEvent,
     Currency,
     DbzeroStore,
+    DirectAccount,
     ExecutionState,
     Intent,
     LedgerDomain,
     LedgerEntry,
     LedgerKind,
     Lifecycle,
+    LocalAccountingVersion,
     Operation,
     Order,
     PortfolioBinding,
@@ -52,6 +66,18 @@ _submission_locks_guard = threading.Lock()
 def _submission_lock(key: str) -> threading.RLock:
     with _submission_locks_guard:
         return _submission_locks.setdefault(key, threading.RLock())
+
+
+def serialized[**P, R](method: Callable[P, R]) -> Callable[P, R]:
+    @wraps(method)
+    def call(*args: P.args, **kwargs: P.kwargs) -> R:
+        service = cast("TraderService", args[0])
+        service._require_context()
+        assert service.prefix is not None
+        with _submission_lock(service.prefix):
+            return method(*args, **kwargs)
+
+    return call
 
 
 def _json(data: Any) -> str:
@@ -80,33 +106,92 @@ class TraderService:
         self._clock = clock
         self._barrier_hook = barrier_hook or (lambda _name: None)
         self._context = None
+        self._direct_identity_source: str | None = None
         self._startup_error: TraderError | None = None
+        self.broker = broker or EtoroBrokerAdapter(self.profile)
         try:
-            self._context = resolve_context(
-                self.profile,
-                scope_verifier or ControlScopeVerifier(),
-                expected_environment=expected_environment,
-                now=clock(),
-            )
+            if self.profile.trading_mode == "standalone":
+                configured = route_environment(self.profile)
+                if configured is None:
+                    raise TraderError(
+                        "ENVIRONMENT_UNVERIFIED", "standalone requires environment-specific broker routes"
+                    )
+                if expected_environment is not None and configured is not Environment(expected_environment):
+                    raise TraderError(
+                        "ENVIRONMENT_ASSERTION_MISMATCH", "expected environment differs from broker routes"
+                    )
+                identity = self.broker.probe_direct(configured)
+                if not identity.get("account_id") or not identity.get("portfolio_id"):
+                    raise TraderError("DIRECT_ACCOUNT_IDENTITY_UNVERIFIED", "broker account identity is unavailable")
+                self._direct_identity_source = identity.get("identity_source", "broker_fields")
+                self._context = VerifiedContext(
+                    configured,
+                    identity["account_id"],
+                    identity["account_id"],
+                    identity["portfolio_id"],
+                    fingerprint(self.profile.user_key),
+                    frozenset(),
+                    clock(),
+                    True,
+                    bool(self.broker.capabilities().get("market")),
+                )
+            else:
+                self._context = resolve_context(
+                    self.profile,
+                    scope_verifier or ControlScopeVerifier(),
+                    expected_environment=expected_environment,
+                    now=clock(),
+                )
         except TraderError as exc:
             self._startup_error = exc
-        self.broker = broker or EtoroBrokerAdapter(self.profile)
         self.store: DbzeroStore | None = None
         self.storage_key: str | None = None
         self.trader: Trader | None = None
         self.prefix: str | None = None
-        if self._context is not None:
-            root = storage_root or fixed_storage_root(self._context.environment)
-            self.store = DbzeroStore(root, self._context.environment)
-            self.store.assert_prefix_isolation()
-            registration = self.store.authenticate(self.trader_id, self.profile.service_credential)
-            self.trader = registration.trader
-            self.storage_key = registration.storage_key
-            self.prefix = self.store.trader_prefix(self.storage_key)
+        with _runtime_lock:
+            if self._context is not None:
+                root = storage_root or fixed_storage_root(self._context.environment)
+                self.store = DbzeroStore(root, self._context.environment)
+                self.store.assert_prefix_isolation()
+                credential = self.profile.service_credential
+                if self.profile.trading_mode == "standalone" and credential is None:
+                    credential = "direct:" + fingerprint(self.profile.user_key)
+                if self.profile.trading_mode == "standalone":
+                    try:
+                        registration = self.store.authenticate(self.trader_id, credential)
+                    except TraderError as exc:
+                        if exc.code != "AUTHENTICATION_REQUIRED" or self.store.one_registration_exists(self.trader_id):
+                            raise
+                        assert credential is not None
+                        registration = self.store.register(self.trader_id, credential)
+                else:
+                    registration = self.store.authenticate(self.trader_id, credential)
+                self.trader = registration.trader
+                self.storage_key = registration.storage_key
+                self.prefix = self.store.trader_prefix(self.storage_key)
+                if self.profile.trading_mode == "standalone":
+                    self._validate_binding()
 
     @property
     def environment(self) -> str | None:
         return None if self._context is None else self._context.environment.value
+
+    @property
+    def trading_mode(self) -> str:
+        return self.profile.trading_mode
+
+    def _direct(self) -> DirectAccount:
+        assert self.store is not None and self.prefix is not None and self._context is not None
+        self.store.open(self.prefix)
+        direct = DirectAccount()
+        if direct.account_id and (
+            direct.account_id != self._context.trading_account_id
+            or direct.portfolio_id != self._context.trading_portfolio_id
+            or direct.credential_fingerprint != self._context.credential_fingerprint
+            or str(direct.environment).lower() != self.environment
+        ):
+            raise TraderError("ACCOUNT_MISMATCH", "direct account identity changed")
+        return direct
 
     def _require_context(self) -> None:
         if self._startup_error is not None:
@@ -125,6 +210,29 @@ class TraderService:
         self._require_context()
         assert self._context is not None
         state, binding = self._objects()
+        assert self.store is not None and self.prefix is not None
+        if not LocalAccountingVersion().initialized:
+            with self.store.transaction(self.prefix):
+                initialize_accounting(state)
+        if self.trading_mode == "standalone":
+            assert self.store is not None and self.prefix is not None
+            if binding.binding_version:
+                raise TraderError("PORTFOLIO_SCOPE_MISMATCH", "standalone cannot reuse an agent portfolio")
+            direct = self._direct()
+            if not direct.account_id:
+                with self.store.transaction(self.prefix):
+                    direct.account_id = self._context.trading_account_id
+                    direct.portfolio_id = self._context.trading_portfolio_id
+                    direct.credential_fingerprint = self._context.credential_fingerprint
+                    direct.identity_source = self._direct_identity_source or "broker_fields"
+                    direct.environment = state.environment
+                    direct.verified_at = self._clock()
+                    direct.lifecycle = Lifecycle.READY
+            if active and (not state.initialized or direct.lifecycle != Lifecycle.ACTIVE):
+                raise TraderError("NOT_INITIALIZED", "initialize the standalone strategy first")
+            if write and not self._context.can_write:
+                raise TraderError("PERMISSION_REQUIRED", "broker opening capability is not configured")
+            return state, binding
         if not binding.binding_version:
             raise TraderError("PORTFOLIO_NOT_BOUND", "no owner-provisioned portfolio is bound")
         if binding.trader != self.trader:
@@ -162,6 +270,8 @@ class TraderService:
         if self._context is None:
             return {
                 "environment": None,
+                "trading_mode": self.trading_mode,
+                "direct_account_verified": False,
                 "environment_verified": False,
                 "verification_error": None if self._startup_error is None else self._startup_error.code,
                 "documented": documented,
@@ -171,19 +281,37 @@ class TraderService:
         effective = {name: bool(enabled and self._context.can_write) for name, enabled in broker_caps.items()}
         try:
             state, binding = self._validate_binding()
-            ready = bool(binding.copy_healthy and binding.lifecycle in {Lifecycle.READY, Lifecycle.ACTIVE})
+            ready = (
+                (self._direct().lifecycle in {Lifecycle.READY, Lifecycle.ACTIVE})
+                if self.trading_mode == "standalone"
+                else bool(binding.copy_healthy and binding.lifecycle in {Lifecycle.READY, Lifecycle.ACTIVE})
+            )
             effective = {name: value and ready for name, value in effective.items()}
-            lifecycle = binding.lifecycle
+            reduction_ready = (
+                self._direct().lifecycle == Lifecycle.ACTIVE
+                if self.trading_mode == "standalone"
+                else binding.lifecycle in {Lifecycle.ACTIVE, Lifecycle.SUSPENDED}
+            )
+            for name in ("cancel", "cancel_close", "partial_close", "modify_protection", "request_lookup"):
+                effective[name] = bool(broker_caps.get(name) and self._context.can_write and reduction_ready)
+            lifecycle = self._direct().lifecycle if self.trading_mode == "standalone" else binding.lifecycle
             initialized = bool(state.initialized)
         except TraderError:
             lifecycle = Lifecycle.UNBOUND
             initialized = False
+            ready = False
             effective = {name: False for name in effective}
         return {
             "environment": self.environment,
+            "trading_mode": self.trading_mode,
+            "direct_account_verified": self.trading_mode == "standalone" and ready,
+            "readiness_error": None
+            if ready
+            else ("DIRECT_ACCOUNT_NOT_READY" if self.trading_mode == "standalone" else "PORTFOLIO_NOT_READY"),
             "environment_verified": True,
             "scope_read": self._context.can_read,
             "scope_write": self._context.can_write,
+            "write_authorization": "broker_authoritative" if self.trading_mode == "standalone" else "verified_scope",
             "lifecycle": str(lifecycle),
             "initialized": initialized,
             "documented": documented,
@@ -195,6 +323,8 @@ class TraderService:
         if self._context is None:
             return {
                 "trader_id": self.trader_id,
+                "trading_mode": self.trading_mode,
+                "direct_account_verified": False,
                 "environment": None,
                 "environment_verified": False,
                 "lifecycle": str(Lifecycle.UNBOUND),
@@ -213,22 +343,53 @@ class TraderService:
         )
         return {
             "trader_id": self.trader_id,
+            "trading_mode": self.trading_mode,
+            "direct_account_verified": self.trading_mode == "standalone",
+            "direct_account_id": self._direct().account_id if self.trading_mode == "standalone" else None,
+            "direct_portfolio_id": self._direct().portfolio_id if self.trading_mode == "standalone" else None,
+            "direct_identity_source": self._direct().identity_source if self.trading_mode == "standalone" else None,
             "environment": self.environment,
             "environment_verified": True,
-            "lifecycle": str(binding.lifecycle),
+            "lifecycle": str(self._direct().lifecycle if self.trading_mode == "standalone" else binding.lifecycle),
             "initialized": bool(state.initialized),
             "currency": str(state.currency),
             "owner_copy_investment_usd": str(binding.investment_usd),
-            "strategy_virtual_balance_usd": str(binding.virtual_balance_usd),
+            "strategy_virtual_balance_usd": str(
+                state.strategy_initial_cap if self.trading_mode == "standalone" else binding.virtual_balance_usd
+            ),
             "strategy_budget": strategy.as_dict(),
             "owner_mirror_budget": owner.as_dict(),
-            "copy_healthy": bool(binding.copy_healthy),
-            "scope_status": "read_write" if self._context.can_write else "read_only",
-            "verified_at": api_value(binding.verified_at),
+            "copy_healthy": bool(binding.copy_healthy) if self.trading_mode == "bound" else None,
+            "mirror_reconciliation_state": "NOT_APPLICABLE" if self.trading_mode == "standalone" else "PENDING",
+            "scope_status": (
+                "broker_write_authoritative"
+                if self.trading_mode == "standalone"
+                else "read_write"
+                if self._context.can_write
+                else "read_only"
+            ),
+            "verified_at": api_value(
+                self._direct().verified_at if self.trading_mode == "standalone" else binding.verified_at
+            ),
         }
 
     def portfolio(self) -> dict[str, Any]:
         state, binding = self._validate_binding()
+        if self.trading_mode == "standalone":
+            return {
+                "trader_id": self.trader_id,
+                "trading_mode": "standalone",
+                "environment": self.environment,
+                "direct_account_id": self._direct().account_id,
+                "direct_portfolio_id": self._direct().portfolio_id,
+                "direct_identity_source": self._direct().identity_source,
+                "lifecycle": str(self._direct().lifecycle),
+                "policy_version": state.policy_version,
+                "owner_copy_investment_usd": "0.00",
+                "strategy_virtual_balance_usd": str(state.strategy_initial_cap),
+                "copy_healthy": None,
+                "mirror_reconciliation_state": "NOT_APPLICABLE",
+            }
         return {
             "trader_id": self.trader_id,
             "environment": str(binding.environment).lower() if binding.environment is not None else None,
@@ -242,37 +403,71 @@ class TraderService:
             "copy_healthy": bool(binding.copy_healthy),
         }
 
+    @serialized
     def initialize(self, expected_investment: object, currency: str = "USD") -> dict[str, Any]:
-        state, binding = self._validate_binding()
-        if currency != "USD":
-            raise TraderError("UNSUPPORTED_CURRENCY", "only USD is supported")
-        expected = money(expected_investment)
-        if expected != money(binding.investment_usd):
-            raise TraderError("ACCOUNT_MISMATCH", "expected investment does not match owner-approved copy investment")
-        if state.initialized:
-            if state.owner_initial_cap == expected and state.currency == Currency.USD:
-                return self.trader_status()
-            raise TraderError("ALREADY_INITIALIZED", "portfolio activation parameters are immutable")
-        if not binding.copy_healthy or binding.lifecycle != Lifecycle.READY:
-            raise TraderError("PORTFOLIO_NOT_READY", "portfolio identity and copy relationship must be ready")
-        assert (
-            self.broker is not None and self._context is not None and self.store is not None and self.prefix is not None
-        )
+        self._require_context()
+        assert self._context is not None
         self.broker.verify_identity(self._context)
-        with self.store.transaction(self.prefix):
-            state.initialized = True
-            state.currency = Currency.USD
-            state.owner_initial_cap = expected
-            state.strategy_initial_cap = min(expected, money(binding.virtual_balance_usd))
-            binding.lifecycle = Lifecycle.ACTIVE
-            self.store.append_audit(
-                self.prefix,
-                state,
-                kind="ACTIVATED",
-                actor=self.trader_id,
-                facts={"expected_investment_usd": str(expected), "currency": currency},
+        with _runtime_lock:
+            state, binding = self._validate_binding()
+            if currency != "USD":
+                raise TraderError("UNSUPPORTED_CURRENCY", "only USD is supported")
+            expected = money(expected_investment)
+            if self.trading_mode == "standalone":
+                if expected <= 0:
+                    raise TraderError("INVALID_AMOUNT", "standalone capital must be positive")
+                assert self.store is not None and self.prefix is not None
+                if state.initialized:
+                    if state.strategy_initial_cap == expected and state.currency == Currency.USD:
+                        return self.trader_status()
+                    raise TraderError("ALREADY_INITIALIZED", "strategy capital is immutable")
+                direct = self._direct()
+                if direct.lifecycle != Lifecycle.READY:
+                    raise TraderError("DIRECT_ACCOUNT_NOT_READY", "direct broker identity is not ready")
+                with self.store.transaction(self.prefix):
+                    state.initialized = True
+                    state.currency = Currency.USD
+                    state.strategy_initial_cap = expected
+                    state.owner_initial_cap = Decimal("0.00")
+                    direct.lifecycle = Lifecycle.ACTIVE
+                    self.store.append_audit(
+                        self.prefix,
+                        state,
+                        kind="ACTIVATED",
+                        actor=self.trader_id,
+                        facts={"expected_investment_usd": str(expected), "trading_mode": "standalone"},
+                    )
+                return self.trader_status()
+            if expected != money(binding.investment_usd):
+                raise TraderError(
+                    "ACCOUNT_MISMATCH", "expected investment does not match owner-approved copy investment"
+                )
+            if state.initialized:
+                if state.owner_initial_cap == expected and state.currency == Currency.USD:
+                    return self.trader_status()
+                raise TraderError("ALREADY_INITIALIZED", "portfolio activation parameters are immutable")
+            if not binding.copy_healthy or binding.lifecycle != Lifecycle.READY:
+                raise TraderError("PORTFOLIO_NOT_READY", "portfolio identity and copy relationship must be ready")
+            assert (
+                self.broker is not None
+                and self._context is not None
+                and self.store is not None
+                and self.prefix is not None
             )
-        return self.trader_status()
+            with self.store.transaction(self.prefix):
+                state.initialized = True
+                state.currency = Currency.USD
+                state.owner_initial_cap = expected
+                state.strategy_initial_cap = min(expected, money(binding.virtual_balance_usd))
+                binding.lifecycle = Lifecycle.ACTIVE
+                self.store.append_audit(
+                    self.prefix,
+                    state,
+                    kind="ACTIVATED",
+                    actor=self.trader_id,
+                    facts={"expected_investment_usd": str(expected), "currency": currency},
+                )
+            return self.trader_status()
 
     def _budget_pair(self, state: TraderState) -> tuple[Budget, Budget]:
         return (
@@ -322,6 +517,7 @@ class TraderService:
             **api_value(params),
         }
 
+    @serialized
     def preview_open(
         self,
         *,
@@ -337,13 +533,14 @@ class TraderService:
         stop_loss_rate: object | None = None,
         take_profit_rate: object | None = None,
     ) -> dict[str, Any]:
-        state, binding = self._validate_binding(active=True, write=True)
-        if not binding.copy_healthy:
-            raise TraderError("COPY_DIVERGENCE", "owner mirror must be reconciled before new exposure")
-        if not self.broker.capabilities().get(order_type, False):
-            raise TraderError("UNSUPPORTED_CAPABILITY", "opening order type is not effectively enabled")
-        assert self._context is not None
-        notional = money(strategy_notional_usd)
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True, write=True)
+            if self.trading_mode == "bound" and not binding.copy_healthy:
+                raise TraderError("COPY_DIVERGENCE", "owner mirror must be reconciled before new exposure")
+            if not self.broker.capabilities().get(order_type, False):
+                raise TraderError("UNSUPPORTED_CAPABILITY", "opening order type is not effectively enabled")
+            assert self._context is not None
+            notional = money(strategy_notional_usd)
         sizing = self.broker.resolve_sizing(
             context=self._context,
             symbol=symbol,
@@ -354,52 +551,73 @@ class TraderService:
             side=side,
         )
         strategy_cost = self.broker.estimate_costs(context=self._context, sizing=sizing, side=side)
-        ratio = money(binding.investment_usd) / money(binding.virtual_balance_usd)
-        owner_cost = money(strategy_cost * ratio)
-        strategy_budget, owner_budget = self._budget_pair(state)
-        admission = admit_open(
-            strategy=strategy_budget,
-            owner=owner_budget,
-            strategy_notional=sizing.full_notional_usd,
-            strategy_cost_buffer=strategy_cost,
-            owner_cost_buffer=owner_cost,
-            investment=money(binding.investment_usd),
-            virtual_balance=money(binding.virtual_balance_usd),
-        )
-
-        def convert(value: object | None) -> Decimal | None:
-            return None if value is None else money(value)
-
-        payload = open_payload(
-            sizing=sizing,
-            side=side,
-            order_type=order_type,
-            leverage=leverage,
-            trigger_rate=convert(trigger_rate),
-            limit_rate=convert(limit_rate),
-            stop_loss_rate=convert(stop_loss_rate),
-            take_profit_rate=convert(take_profit_rate),
-        )
         fingerprint = self.broker.state_fingerprint(self._context)
-        params = {
-            "symbol": symbol,
-            "instrument_id": sizing.instrument_id,
-            "side": side,
-            "order_type": order_type,
-            "strategy_notional_usd": sizing.full_notional_usd,
-            "broker_amount_usd": sizing.amount_usd,
-            "broker_units": sizing.units,
-            "leverage": leverage,
-            "estimated_strategy_cost_usd": strategy_cost,
-            "estimated_owner_copied_notional_usd": admission.estimated_owner_notional,
-            "estimated_owner_cost_usd": owner_cost,
-            "strategy_reservation_usd": admission.strategy_reservation,
-            "owner_reservation_usd": admission.owner_reservation,
-            "strategy_remaining_budget_usd": admission.strategy_remaining,
-            "owner_remaining_budget_usd": admission.owner_remaining,
-            "broker_payload": payload,
-        }
-        return self._persist_preview(Operation.open, params, state, binding, fingerprint)
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True, write=True)
+            strategy_budget, owner_budget = self._budget_pair(state)
+            if self.trading_mode == "standalone":
+                reservation = reserve_money(sizing.full_notional_usd + strategy_cost)
+                if reservation > strategy_budget.available_to_open:
+                    raise TraderError("INSUFFICIENT_BUDGET", "the operation exceeds the strategy budget")
+                from .accounting import Admission
+
+                admission = Admission(
+                    reservation,
+                    Decimal("0.00"),
+                    money(strategy_budget.available_to_open - reservation),
+                    Decimal("0.00"),
+                    Decimal("0.00"),
+                )
+                owner_cost = Decimal("0.00")
+            else:
+                ratio = money(binding.investment_usd) / money(binding.virtual_balance_usd)
+                owner_cost = money(strategy_cost * ratio)
+                admission = admit_open(
+                    strategy=strategy_budget,
+                    owner=owner_budget,
+                    strategy_notional=sizing.full_notional_usd,
+                    strategy_cost_buffer=strategy_cost,
+                    owner_cost_buffer=owner_cost,
+                    investment=money(binding.investment_usd),
+                    virtual_balance=money(binding.virtual_balance_usd),
+                )
+
+            def convert(value: object | None) -> Decimal | None:
+                return None if value is None else money(value)
+
+            payload = open_payload(
+                sizing=sizing,
+                side=side,
+                order_type=order_type,
+                leverage=leverage,
+                trigger_rate=convert(trigger_rate),
+                limit_rate=convert(limit_rate),
+                stop_loss_rate=convert(stop_loss_rate),
+                take_profit_rate=convert(take_profit_rate),
+            )
+            params = {
+                "symbol": symbol,
+                "instrument_id": sizing.instrument_id,
+                "side": side,
+                "order_type": order_type,
+                "strategy_notional_usd": sizing.full_notional_usd,
+                "broker_amount_usd": sizing.amount_usd,
+                "broker_units": sizing.units,
+                "leverage": leverage,
+                "estimated_strategy_cost_usd": strategy_cost,
+                "estimated_owner_copied_notional_usd": admission.estimated_owner_notional,
+                "estimated_owner_cost_usd": owner_cost,
+                "strategy_reservation_usd": admission.strategy_reservation,
+                "owner_reservation_usd": admission.owner_reservation,
+                "strategy_remaining_budget_usd": admission.strategy_remaining,
+                "owner_remaining_budget_usd": admission.owner_remaining,
+                "broker_payload": payload,
+                "trigger_rate": convert(trigger_rate),
+                "limit_rate": convert(limit_rate),
+                "stop_loss_rate": convert(stop_loss_rate),
+                "take_profit_rate": convert(take_profit_rate),
+            }
+            return self._persist_preview(Operation.open, params, state, binding, fingerprint)
 
     def _owned_position(self, position_id: str) -> Position:
         assert self.store is not None and self.prefix is not None
@@ -415,6 +633,7 @@ class TraderService:
             raise TraderError("NOT_FOUND", "order not found")
         return order
 
+    @serialized
     def preview_close(
         self,
         *,
@@ -422,23 +641,30 @@ class TraderService:
         position_id: str,
         fraction: object = "1",
     ) -> dict[str, Any]:
-        state, binding = self._validate_binding(active=True, write=True, reduction=True)
-        position = self._owned_position(position_id)
-        close_fraction = Decimal(str(fraction))
-        if not close_fraction.is_finite() or close_fraction <= 0 or close_fraction > 1:
-            raise TraderError("INVALID_AMOUNT", "fraction must be in (0, 1]")
-        units = position.units * close_fraction
-        params = {
-            "position_id": position_id,
-            "fraction": close_fraction,
-            "units_to_deduct": units,
-            "instrument_id": int(position.instrument_id),
-        }
+        self._require_context()
         assert self._context is not None
-        return self._persist_preview(
-            Operation.close, params, state, binding, self.broker.state_fingerprint(self._context)
-        )
+        fingerprint = self.broker.state_fingerprint(self._context)
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True, write=True, reduction=True)
+            position = self._owned_position(position_id)
+            close_fraction = Decimal(str(fraction))
+            if not close_fraction.is_finite() or close_fraction <= 0 or close_fraction > 1:
+                raise TraderError("INVALID_AMOUNT", "fraction must be in (0, 1]")
+            if not self.broker.capabilities().get("partial_close"):
+                raise TraderError("UNSUPPORTED_CAPABILITY", "position closing is unavailable")
+            units = position.units * close_fraction
+            params = {
+                "position_id": position_id,
+                "fraction": close_fraction,
+                "units_to_deduct": units,
+                "instrument_id": int(position.instrument_id),
+                "symbol": position.symbol,
+                "strategy_notional_usd": money(position.strategy_notional_usd * close_fraction),
+            }
+            assert self._context is not None
+            return self._persist_preview(Operation.close, params, state, binding, fingerprint)
 
+    @serialized
     def preview_modify(
         self,
         *,
@@ -448,35 +674,54 @@ class TraderService:
         take_profit_rate: object | None = None,
         stop_loss_type: str | None = None,
     ) -> dict[str, Any]:
-        state, binding = self._validate_binding(active=True, write=True, reduction=True)
-        self._owned_position(position_id)
-        if stop_loss_rate is None and take_profit_rate is None:
-            raise TraderError("INVALID_ORDER", "at least one protection rate is required")
-        if stop_loss_type not in {None, "rate", "trailing"}:
-            raise TraderError("INVALID_ORDER", "unsupported stop-loss type")
-        params = {
-            "position_id": position_id,
-            "stop_loss_rate": None if stop_loss_rate is None else money(stop_loss_rate),
-            "take_profit_rate": None if take_profit_rate is None else money(take_profit_rate),
-            "stop_loss_type": stop_loss_type,
-        }
+        self._require_context()
         assert self._context is not None
-        return self._persist_preview(
-            Operation.modify, params, state, binding, self.broker.state_fingerprint(self._context)
-        )
+        fingerprint = self.broker.state_fingerprint(self._context)
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True, write=True, reduction=True)
+            self._owned_position(position_id)
+            if stop_loss_rate is None and take_profit_rate is None:
+                raise TraderError("INVALID_ORDER", "at least one protection rate is required")
+            if stop_loss_type not in {None, "rate", "trailing"}:
+                raise TraderError("INVALID_ORDER", "unsupported stop-loss type")
+            params = {
+                "position_id": position_id,
+                "stop_loss_rate": None if stop_loss_rate is None else money(stop_loss_rate),
+                "take_profit_rate": None if take_profit_rate is None else money(take_profit_rate),
+                "stop_loss_type": stop_loss_type,
+            }
+            assert self._context is not None
+            return self._persist_preview(Operation.modify, params, state, binding, fingerprint)
 
+    @serialized
     def preview_cancel(
         self,
         *,
         # External eToro numeric order ID represented as text, not a memo ID.
         order_id: str,
     ) -> dict[str, Any]:
-        state, binding = self._validate_binding(active=True, write=True, reduction=True)
-        self._owned_order(order_id)
+        self._require_context()
         assert self._context is not None
-        return self._persist_preview(
-            Operation.cancel, {"order_id": order_id}, state, binding, self.broker.state_fingerprint(self._context)
-        )
+        fingerprint = self.broker.state_fingerprint(self._context)
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True, write=True, reduction=True)
+            order = self._owned_order(order_id)
+            cancel_type = "cancel_close" if order.intent.operation == Operation.close else "cancel"
+            if not self.broker.capabilities().get(cancel_type):
+                raise TraderError("UNSUPPORTED_CAPABILITY", "pending order cancellation is unavailable")
+            assert self._context is not None
+            return self._persist_preview(
+                Operation.cancel,
+                {
+                    "order_id": order_id,
+                    "symbol": order.symbol,
+                    "instrument_id": order.intent.params.get("instrument_id"),
+                    "cancel_type": cancel_type,
+                },
+                state,
+                binding,
+                fingerprint,
+            )
 
     def _api_reference[T](self, identifier: str, model: type[T]) -> T:
         """Resolve an incoming API ID once, checking both type and trader ownership."""
@@ -494,6 +739,7 @@ class TraderService:
         if preview.expires_at.astimezone(UTC) <= self._clock():
             raise TraderError("STALE_PREVIEW", "preview expired")
 
+    @serialized
     def submit(
         self,
         # Preview's dbzero UUID serialized at the API boundary; internal links use instances.
@@ -503,91 +749,109 @@ class TraderService:
     ) -> dict[str, Any]:
         if not idempotency_key or len(idempotency_key) > 200:
             raise TraderError("INVALID_IDEMPOTENCY_KEY", "a bounded idempotency key is required")
-        state, binding = self._validate_binding(active=True, write=True, reduction=True)
-        assert (
-            self.store is not None
-            and self.prefix is not None
-            and self.storage_key is not None
-            and self._context is not None
-        )
-        key_digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
-        key_tag = f"key:{binding.binding_version}:{key_digest}"
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True, write=True, reduction=True)
+            assert (
+                self.store is not None
+                and self.prefix is not None
+                and self.storage_key is not None
+                and self._context is not None
+            )
+            key_digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
+            key_tag = f"key:{'direct' if self.trading_mode == 'standalone' else binding.binding_version}:{key_digest}"
         with _submission_lock(self.prefix):
-            preview = self._api_reference(preview_id, Preview)
-            prior = self.store.one(Intent, key_tag, prefix=self.prefix)
-            if prior is not None:
-                if prior.preview != preview:
-                    raise TraderError("IDEMPOTENCY_CONFLICT", "idempotency key was used for another preview")
-                return self._intent_value(prior)
-            self._validate_preview(preview)
-            state, binding = self._validate_binding(
-                active=True, write=True, reduction=preview.operation != Operation.open
-            )
-            if preview.binding_version != binding.binding_version or preview.policy_version != state.policy_version:
-                raise TraderError("STALE_PREVIEW", "binding or policy changed")
-            if preview.state_fingerprint != self.broker.state_fingerprint(self._context):
-                raise TraderError("STALE_PREVIEW", "broker state changed")
-            params = native_copy(preview.params)
-            self._revalidate_admission(preview.operation, params, state, binding)
-            request_id = str(uuid.uuid4())
-            command_digest = hashlib.sha256(
-                _json(
-                    [self.environment, self.trader_id, binding.binding_version, preview.operation, params, request_id]
-                ).encode()
-            ).hexdigest()
-            strategy_reservation = money(params.get("strategy_reservation_usd", "0"))
-            owner_reservation = money(params.get("owner_reservation_usd", "0"))
-            self.store.open(self.prefix)
-            with self.store.transaction(self.prefix):
-                intent = Intent(
-                    preview,
-                    idempotency_key,
-                    preview.operation,
-                    native_copy(preview.params),
-                    request_id,
-                    command_digest,
-                    int(binding.binding_version),
-                    int(state.policy_version),
-                    created_at=storage_datetime(self._clock()),
+            with _runtime_lock:
+                preview = self._api_reference(preview_id, Preview)
+                prior = self.store.one(Intent, key_tag, prefix=self.prefix)
+                if prior is not None:
+                    if prior.preview != preview:
+                        raise TraderError("IDEMPOTENCY_CONFLICT", "idempotency key was used for another preview")
+                    return self._intent_value(prior)
+                self._validate_preview(preview)
+                state, binding = self._validate_binding(
+                    active=True, write=True, reduction=preview.operation != Operation.open
                 )
-                self.store.tag(intent, key_tag, "INTENT")
-                if preview.operation in {Operation.close, Operation.modify}:
-                    db0.tags(self._owned_position(params["position_id"])).add(db0.as_tag(intent))
-                elif preview.operation == Operation.cancel:
-                    db0.tags(self._owned_order(params["order_id"])).add(db0.as_tag(intent))
-                reservation = Reservation(
-                    intent,
-                    strategy_reservation,
-                    owner_reservation,
-                    int(binding.binding_version),
-                    int(state.policy_version),
+                if preview.binding_version != binding.binding_version or preview.policy_version != state.policy_version:
+                    raise TraderError("STALE_PREVIEW", "binding or policy changed")
+            broker_fingerprint = self.broker.state_fingerprint(self._context)
+            with _runtime_lock:
+                state, binding = self._validate_binding(
+                    active=True, write=True, reduction=preview.operation != Operation.open
                 )
-                self.store.tag(reservation, "RESERVATION")
-                state.strategy_committed = money(state.strategy_committed) + strategy_reservation
-                state.owner_committed = money(state.owner_committed) + owner_reservation
-                self.store.append_audit(
-                    self.prefix,
-                    state,
-                    kind="INTENT_COMMITTED",
-                    actor=self.trader_id,
-                    intent=intent,
-                    facts={"operation": str(preview.operation), "request_id": request_id},
-                )
-            self._barrier_hook("trader_intent_committed")
-
-            control = self.store.reserve_control(
-                command_digest=command_digest,
-                storage_key=self.storage_key,
-                request_id=request_id,
-                binding_version=int(binding.binding_version),
-            )
-            with self.store.transaction(self.prefix):
+                self._validate_preview(preview)
+                if preview.binding_version != binding.binding_version or preview.policy_version != state.policy_version:
+                    raise TraderError("STALE_PREVIEW", "binding or policy changed")
+                if preview.state_fingerprint != broker_fingerprint:
+                    raise TraderError("STALE_PREVIEW", "broker state changed")
+                params = native_copy(preview.params)
+                self._revalidate_admission(preview.operation, params, state, binding)
+                request_id = str(uuid.uuid4())
+                command_digest = hashlib.sha256(
+                    _json(
+                        [
+                            self.environment,
+                            self.trader_id,
+                            binding.binding_version,
+                            preview.operation,
+                            params,
+                            request_id,
+                        ]
+                    ).encode()
+                ).hexdigest()
+                strategy_reservation = money(params.get("strategy_reservation_usd", "0"))
+                owner_reservation = money(params.get("owner_reservation_usd", "0"))
                 self.store.open(self.prefix)
-                intent.state = ExecutionState.ADMITTED
-                record_operation(intent, self._clock())
-            self._barrier_hook("control_reservation_committed")
+                with self.store.transaction(self.prefix):
+                    intent = Intent(
+                        preview,
+                        idempotency_key,
+                        preview.operation,
+                        native_copy(preview.params),
+                        request_id,
+                        command_digest,
+                        int(binding.binding_version),
+                        int(state.policy_version),
+                        created_at=storage_datetime(self._clock()),
+                    )
+                    self.store.tag(intent, key_tag, "INTENT")
+                    if preview.operation in {Operation.close, Operation.modify}:
+                        db0.tags(self._owned_position(params["position_id"])).add(db0.as_tag(intent))
+                    elif preview.operation == Operation.cancel:
+                        db0.tags(self._owned_order(params["order_id"])).add(db0.as_tag(intent))
+                    reservation = Reservation(
+                        intent,
+                        strategy_reservation,
+                        owner_reservation,
+                        int(binding.binding_version),
+                        int(state.policy_version),
+                    )
+                    self.store.tag(reservation, "RESERVATION")
+                    state.strategy_committed = money(state.strategy_committed) + strategy_reservation
+                    state.owner_committed = money(state.owner_committed) + owner_reservation
+                    self.store.append_audit(
+                        self.prefix,
+                        state,
+                        kind="INTENT_COMMITTED",
+                        actor=self.trader_id,
+                        intent=intent,
+                        facts={"operation": str(preview.operation), "request_id": request_id},
+                    )
+                self._barrier_hook("trader_intent_committed")
 
-            mutation = self._mutation(preview.operation, params, request_id)
+                control = self.store.reserve_control(
+                    command_digest=command_digest,
+                    storage_key=self.storage_key,
+                    request_id=request_id,
+                    binding_version=int(binding.binding_version),
+                )
+                with self.store.transaction(self.prefix):
+                    self.store.open(self.prefix)
+                    intent.state = ExecutionState.ADMITTED
+                    record_operation(intent, self._clock())
+                self._barrier_hook("control_reservation_committed")
+
+                mutation = self._mutation(preview.operation, params, request_id)
+            error_code = None
             try:
                 outcome = self.broker.dispatch(self._context, mutation)
             except TraderError as exc:
@@ -595,48 +859,80 @@ class TraderService:
                     state=IntentState.UNKNOWN if exc.code == "BROKER_OUTCOME_UNKNOWN" else IntentState.REJECTED,
                     request_id=request_id,
                 )
-                intent.error_code = exc.code
-            for entity_type, broker_id in (
-                ("order", outcome.broker_order_id),
-                ("position", outcome.broker_position_id),
-            ):
-                if broker_id is not None:
-                    self.store.claim_ownership(
-                        environment=self._context.environment.value,
-                        trading_account_id=self._context.trading_account_id,
-                        trading_portfolio_id=self._context.trading_portfolio_id,
-                        entity_type=entity_type,
-                        broker_id=broker_id,
-                        storage_key=self.storage_key,
-                    )
-            control.state = getattr(ExecutionState, outcome.state.name)
-            control.outcome = {**asdict(outcome), "state": outcome.state.value}
-            self.store.append_control_event(
-                "BROKER_OUTCOME_RECORDED",
-                {
-                    "command_digest": command_digest,
-                    "request_id": request_id,
-                    "state": outcome.state.value,
-                },
-            )
-            self.store.commit(self.store.control_prefix)
-            self._barrier_hook("control_outcome_committed")
-            self._project_outcome(intent, reservation, outcome, params, state, binding)
-            self.store.commit(self.prefix)
-            self._barrier_hook("trader_outcome_projected")
-            return self._intent_value(intent)
+                error_code = exc.code
+            except Exception:
+                outcome = BrokerOutcome(IntentState.UNKNOWN, request_id)
+                error_code = "BROKER_OUTCOME_UNKNOWN"
+            with _runtime_lock:
+                self.store.open(self.prefix)
+                intent.error_code = error_code
+            with _runtime_lock:
+                for entity_type, broker_id in (
+                    ("order", outcome.broker_order_id),
+                    ("position", outcome.broker_position_id),
+                ):
+                    if broker_id is not None:
+                        self.store.claim_ownership(
+                            environment=self._context.environment.value,
+                            trading_account_id=self._context.trading_account_id,
+                            trading_portfolio_id=self._context.trading_portfolio_id,
+                            entity_type=entity_type,
+                            broker_id=broker_id,
+                            storage_key=self.storage_key,
+                        )
+                control.state = getattr(ExecutionState, outcome.state.name)
+                control.outcome = {**asdict(outcome), "state": outcome.state.value}
+                self.store.append_control_event(
+                    "BROKER_OUTCOME_RECORDED",
+                    {
+                        "command_digest": command_digest,
+                        "request_id": request_id,
+                        "state": outcome.state.value,
+                    },
+                )
+                self.store.commit(self.store.control_prefix)
+                self._barrier_hook("control_outcome_committed")
+                self._project_outcome(intent, reservation, outcome, params, state, binding)
+                self.store.commit(self.prefix)
+                self._barrier_hook("trader_outcome_projected")
+                return self._intent_value(intent)
 
     def _revalidate_admission(
         self, operation: Operation, params: dict[str, Any], state: TraderState, binding: PortfolioBinding
     ) -> None:
-        if operation != Operation.open:
+        if operation in {Operation.close, Operation.modify}:
+            position = self._owned_position(params["position_id"])
+            if operation == Operation.close:
+                if position.units <= 0:
+                    raise TraderError("EXECUTION_DETAILS_UNAVAILABLE", "confirmed position units are required")
+                if position.units * Decimal(params["fraction"]) != Decimal(params["units_to_deduct"]):
+                    raise TraderError("STALE_PREVIEW", "position size changed")
+            pending = self.store.all(Intent, prefix=self.prefix) if self.store and self.prefix else []
+            if any(
+                i.operation == Operation.close
+                and i.params.get("position_id") == position.position_id
+                and i.state in {ExecutionState.ADMITTED, ExecutionState.UNKNOWN, ExecutionState.ACKNOWLEDGED}
+                for i in pending
+            ):
+                raise TraderError("EXECUTION_PENDING", "reconcile the existing close first")
             return
-        if not binding.copy_healthy:
+        if operation == Operation.cancel:
+            self._owned_order(params["order_id"])
+            assert self.store is not None and self.prefix is not None
+            if any(
+                i.operation == Operation.cancel
+                and i.params.get("order_id") == params["order_id"]
+                and i.state in {ExecutionState.ADMITTED, ExecutionState.UNKNOWN, ExecutionState.ACKNOWLEDGED}
+                for i in self.store.all(Intent, prefix=self.prefix)
+            ):
+                raise TraderError("EXECUTION_PENDING", "reconcile the existing cancellation first")
+            return
+        if self.trading_mode == "bound" and not binding.copy_healthy:
             raise TraderError("COPY_DIVERGENCE", "owner mirror must be reconciled before new exposure")
         strategy, owner = self._budget_pair(state)
         if money(params["strategy_reservation_usd"]) > strategy.available_to_open:
             raise TraderError("INSUFFICIENT_BUDGET", "strategy budget changed")
-        if money(params["owner_reservation_usd"]) > owner.available_to_open:
+        if self.trading_mode == "bound" and money(params["owner_reservation_usd"]) > owner.available_to_open:
             raise TraderError("INSUFFICIENT_BUDGET", "owner budget changed")
 
     def _mutation(self, operation: Operation, params: dict[str, Any], request_id: str) -> BrokerMutation:
@@ -664,7 +960,7 @@ class TraderService:
             }
             return BrokerMutation(request_id, str(operation), api_value(payload), params["position_id"])
         if operation == Operation.cancel:
-            return BrokerMutation(request_id, str(operation), {}, params["order_id"])
+            return BrokerMutation(request_id, params.get("cancel_type", "cancel"), {}, params["order_id"])
         raise TraderError("UNSUPPORTED_CAPABILITY", "unknown preview operation")
 
     def _project_outcome(
@@ -686,11 +982,45 @@ class TraderService:
                     and intent.projected_state != target_state
                 ):
                     return
-                if intent.projected_state != target_state:
+                missing_position = (
+                    intent.operation == Operation.open
+                    and outcome.state == IntentState.FILLED
+                    and not intent.broker_position_id
+                    and outcome.broker_position_id is not None
+                )
+                if intent.projected_state != target_state or missing_position:
                     self._apply_outcome(intent, reservation, outcome, params, state, binding)
                     intent.projected_state = target_state
+                record_fill(intent, outcome, state)
+                self._sync_position(intent, state, binding)
                 record_operation(intent, self._clock(), outcome)
             self.store.commit(self.prefix)
+
+    def _sync_position(self, intent: Intent, state: TraderState, binding: PortfolioBinding) -> None:
+        assert self.store is not None and self.prefix is not None
+        position_id = (
+            intent.broker_position_id if intent.operation == Operation.open else intent.params.get("position_id")
+        )
+        if not position_id or intent.operation not in {Operation.open, Operation.close}:
+            return
+        position = self.store.one(Position, str(position_id), prefix=self.prefix)
+        if position is None:
+            return
+        entry = fill_for(position.intent)
+        value = position_value(position)
+        if entry is None or not entry.units or value.remaining_units is None:
+            return
+        remaining_notional = money(
+            Decimal(position.intent.params["strategy_notional_usd"]) * value.remaining_units / entry.units
+        )
+        released = position.strategy_notional_usd - remaining_notional
+        state.strategy_committed = max(Decimal(0), state.strategy_committed - released)
+        if self.trading_mode == "bound":
+            owner_delta = released * binding.investment_usd / binding.virtual_balance_usd
+            state.owner_committed = max(Decimal(0), money(state.owner_committed - owner_delta))
+        position.units = value.remaining_units
+        position.strategy_notional_usd = remaining_notional
+        position.state = PositionState.CLOSED if value.remaining_units == 0 else PositionState.OPEN
 
     def _apply_outcome(
         self,
@@ -704,8 +1034,8 @@ class TraderService:
         assert self.store is not None and self.prefix is not None
         self.store.open(self.prefix)
         intent.state = getattr(ExecutionState, outcome.state.name)
-        intent.broker_order_id = outcome.broker_order_id
-        intent.broker_position_id = outcome.broker_position_id
+        intent.broker_order_id = outcome.broker_order_id or intent.broker_order_id
+        intent.broker_position_id = outcome.broker_position_id or intent.broker_position_id
         if outcome.state in {IntentState.REJECTED, IntentState.CANCELED} and reservation.state == ReservationState.HELD:
             state.strategy_committed = max(
                 Decimal("0"), money(state.strategy_committed) - money(reservation.strategy_amount_usd)
@@ -737,16 +1067,6 @@ class TraderService:
             else:
                 order.state = order_state
         if intent.operation == Operation.open and outcome.state is IntentState.FILLED and outcome.broker_position_id:
-            estimated_strategy_cost = money(params["estimated_strategy_cost_usd"])
-            actual_strategy_cost = (
-                estimated_strategy_cost if outcome.actual_cost_usd is None else outcome.actual_cost_usd
-            )
-            state.strategy_committed = money(state.strategy_committed) - estimated_strategy_cost
-            state.strategy_realized = money(
-                money(state.strategy_realized, allow_negative=True) - actual_strategy_cost,
-                allow_negative=True,
-            )
-
             position = Position(
                 outcome.broker_position_id,
                 intent,
@@ -755,7 +1075,7 @@ class TraderService:
                 int(params["instrument_id"]),
                 int(params["leverage"]),
                 money(params["strategy_notional_usd"]),
-                outcome.filled_units or Decimal(params["broker_units"]),
+                outcome.filled_units if outcome.filled_units is not None else Decimal(0),
             )
             self.store.tag(position, "POSITION")
             entry = LedgerEntry(
@@ -766,29 +1086,13 @@ class TraderService:
                 self._clock(),
             )
             self.store.tag(entry, "LEDGER")
-            binding.copy_healthy = False
+            if self.trading_mode == "bound":
+                binding.copy_healthy = False
         elif intent.operation == Operation.close and outcome.state is IntentState.FILLED:
             position = self._owned_position(params["position_id"])
             db0.tags(position).add(db0.as_tag(intent))
-            fraction = Decimal(params["fraction"])
-            released = money(position.strategy_notional_usd * fraction)
-            owner_released = copied_notional(
-                released, money(binding.investment_usd), money(binding.virtual_balance_usd)
-            )
-            state.strategy_committed = max(Decimal("0"), money(state.strategy_committed) - released)
-            state.owner_committed = max(Decimal("0"), money(state.owner_committed) - owner_released)
-            if fraction == 1:
-                position.state = PositionState.CLOSED
-            else:
-                position.strategy_notional_usd = money(position.strategy_notional_usd - released)
-                position.units = position.units - Decimal(params["units_to_deduct"])
-            if outcome.realized_pnl_usd is not None:
-                state.strategy_realized = money(
-                    money(state.strategy_realized, allow_negative=True) + outcome.realized_pnl_usd,
-                    allow_negative=True,
-                )
-
-            binding.copy_healthy = False
+            if self.trading_mode == "bound":
+                binding.copy_healthy = False
         elif intent.operation == Operation.cancel and outcome.state in {IntentState.FILLED, IntentState.CANCELED}:
             order = self._owned_order(params["order_id"])
             db0.tags(order).add(db0.as_tag(intent))
@@ -825,7 +1129,9 @@ class TraderService:
                 "order_id": outcome.broker_order_id,
                 "position_id": outcome.broker_position_id,
                 "response_fingerprint": outcome.raw_fingerprint,
-                "mirror_reconciliation_state": "PENDING" if outcome.state is IntentState.FILLED else "UNCHANGED",
+                "mirror_reconciliation_state": "NOT_APPLICABLE"
+                if self.trading_mode == "standalone"
+                else ("PENDING" if outcome.state is IntentState.FILLED else "UNCHANGED"),
             },
         )
 
@@ -838,9 +1144,78 @@ class TraderService:
             "broker_order_id": intent.broker_order_id or None,
             "broker_position_id": intent.broker_position_id or None,
             "strategy_execution_state": str(intent.state),
-            "mirror_reconciliation_state": "PENDING" if intent.state == ExecutionState.FILLED else "UNCHANGED",
+            "mirror_reconciliation_state": "NOT_APPLICABLE"
+            if self.trading_mode == "standalone"
+            else ("PENDING" if intent.state == ExecutionState.FILLED else "UNCHANGED"),
             "error_code": intent.error_code or None,
         }
+
+    def smoke_demo(
+        self,
+        expected_investment: object,
+        symbol: str = "ETH",
+        strategy_notional_usd: object = "100",
+        *,
+        reconcile: bool = False,
+    ) -> dict[str, Any]:
+        """One durable direct-demo order per account, trader and exact smoke parameters."""
+        if self.trading_mode != "standalone" or self.environment != "demo":
+            raise TraderError("DEMO_ONLY", "smoke trading requires an explicit standalone demo profile")
+        self._require_context()
+        assert self.store is not None and self.prefix is not None and self._context is not None
+        capital = money(expected_investment)
+        notional = money(strategy_notional_usd)
+        if not symbol or not symbol.isalnum() or notional <= 0:
+            raise TraderError("INVALID_ORDER", "smoke symbol and positive notional are required")
+        key = (
+            "smoke-demo:"
+            + hashlib.sha256(
+                _json(
+                    [
+                        self.trader_id,
+                        self._context.trading_account_id,
+                        capital,
+                        symbol,
+                        notional,
+                    ]
+                ).encode()
+            ).hexdigest()
+        )
+        tag = "key:direct:" + hashlib.sha256(key.encode()).hexdigest()
+        with _submission_lock(self.prefix):
+            self.initialize(capital)
+            prior = self.store.one(Intent, tag, prefix=self.prefix)
+            if prior is None:
+                if reconcile:
+                    raise TraderError("NOT_FOUND", "no smoke submission exists to reconcile")
+                preview = self.preview_open(symbol=symbol, side="long", strategy_notional_usd=notional)
+                outcome = self.submit(preview["preview_id"], key)
+            else:
+                preview = None
+                outcome = self._intent_value(prior)
+            reconciliation = self.reconcile() if reconcile else None
+            if reconcile:
+                prior = self.store.one(Intent, tag, prefix=self.prefix)
+                assert prior is not None
+                outcome = self._intent_value(prior)
+            return {
+                "trading_mode": "standalone",
+                "symbol": symbol,
+                "strategy_notional_usd": str(notional),
+                "strategy_initial_cap_usd": str(capital),
+                "preview": preview,
+                "outcome": outcome,
+                "reconciliation": reconciliation,
+                "reconcile_command": "smoke-demo --expected-investment "
+                + str(capital)
+                + " --symbol "
+                + symbol
+                + " --strategy-notional-usd "
+                + str(notional)
+                + " --reconcile"
+                if outcome["state"] in {"UNKNOWN", "ACKNOWLEDGED", "ADMITTED"}
+                else None,
+            }
 
     def intent_status(
         self,
@@ -886,99 +1261,171 @@ class TraderService:
             if item.state in {ExecutionState.PENDING, ExecutionState.ACKNOWLEDGED}
         ]
 
-    def reconcile(self) -> dict[str, Any]:
-        state, binding = self._validate_binding(active=True)
-        assert (
-            self._context is not None
-            and self.store is not None
-            and self.prefix is not None
-            and self.storage_key is not None
-        )
-        recovered = 0
-        unresolved = 0
-        controls = list(self.store.unresolved_control(self.storage_key))
-        control_digests = {str(control.command_digest) for control in controls}
-        for local_intent in self.store.all(Intent, "INTENT", prefix=self.prefix):
-            if local_intent.state == ExecutionState.COMMITTED and local_intent.command_digest not in control_digests:
-                with self.store.transaction(self.prefix):
-                    local_reservation = self.store.one(Reservation, db0.as_tag(local_intent), prefix=self.prefix)
-                    if local_reservation is not None and local_reservation.state == ReservationState.HELD:
-                        state.strategy_committed = max(
-                            Decimal("0"),
-                            money(state.strategy_committed) - money(local_reservation.strategy_amount_usd),
-                        )
-
-                        state.owner_committed = max(
-                            Decimal("0"),
-                            money(state.owner_committed) - money(local_reservation.owner_amount_usd),
-                        )
-
-                        local_reservation.state = ReservationState.RELEASED
-                    local_intent.state = ExecutionState.CANCELED
-                    self.store.append_audit(
-                        self.prefix,
-                        state,
-                        kind="ORPHAN_INTENT_CANCELED",
-                        actor="coordinator",
-                        intent=local_intent,
-                        source="reconcile",
+    @serialized
+    def refresh_execution_details(self) -> int:
+        """Look up only locally recorded executions; never import broker positions."""
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True)
+            assert self.store is not None and self.prefix is not None and self._context is not None
+            candidates = []
+            for intent in self.store.all(Intent, prefix=self.prefix):
+                if intent.operation not in {Operation.open, Operation.close}:
+                    continue
+                fill = fill_for(intent)
+                if intent.state == ExecutionState.FILLED and (
+                    (intent.operation == Operation.open and not intent.broker_position_id)
+                    or fill is None
+                    or fill.units is None
+                    or fill.price is None
+                    or fill.costs is None
+                    or (intent.operation == Operation.close and fill.gross_pnl is None)
+                ):
+                    candidates.append((intent, intent.broker_order_id, intent.operation, str(intent.request_id)))
+        updated = 0
+        for intent, order_id, operation, request_id in candidates:
+            lookup = self.broker.lookup_close_order if operation == Operation.close else self.broker.lookup_order
+            outcome = (
+                lookup(self._context, str(order_id))
+                if order_id
+                else self.broker.lookup_request(self._context, request_id)
+            )
+            if outcome is None or outcome.state != IntentState.FILLED:
+                continue
+            with _runtime_lock:
+                self.store.open(self.prefix)
+                if (order_id and outcome.broker_order_id != order_id) or (
+                    not order_id and outcome.request_id != request_id
+                ):
+                    raise TraderError("ACCOUNT_MISMATCH", "execution order does not match local ownership")
+                if (
+                    operation == Operation.open
+                    and outcome.broker_position_id is not None
+                    and intent.broker_position_id is not None
+                    and outcome.broker_position_id != intent.broker_position_id
+                ):
+                    raise TraderError("ACCOUNT_MISMATCH", "execution position does not match local ownership")
+                if operation == Operation.open and outcome.broker_position_id:
+                    assert self.storage_key is not None
+                    self.store.claim_ownership(
+                        environment=self._context.environment.value,
+                        trading_account_id=self._context.trading_account_id,
+                        trading_portfolio_id=self._context.trading_portfolio_id,
+                        entity_type="position",
+                        broker_id=outcome.broker_position_id,
+                        storage_key=self.storage_key,
                     )
-                recovered += 1
+                reservation = self.store.one(Reservation, db0.as_tag(intent), prefix=self.prefix)
+                if reservation is not None:
+                    self._project_outcome(intent, reservation, outcome, native_copy(intent.params), state, binding)
+                    for position in self.store.all(Position, prefix=self.prefix):
+                        value = position_value(position)
+                        if value.remaining_units is not None:
+                            position.units = value.remaining_units
+                    self.store.commit(self.prefix)
+                    updated += 1
+        return updated
+
+    @serialized
+    def reconcile(self) -> dict[str, Any]:
+        with _runtime_lock:
+            state, binding = self._validate_binding(active=True)
+            assert (
+                self._context is not None
+                and self.store is not None
+                and self.prefix is not None
+                and self.storage_key is not None
+            )
+            recovered = 0
+            unresolved = 0
+            controls = list(self.store.unresolved_control(self.storage_key))
+            control_digests = {str(control.command_digest) for control in controls}
+            for local_intent in self.store.all(Intent, "INTENT", prefix=self.prefix):
+                if (
+                    local_intent.state == ExecutionState.COMMITTED
+                    and local_intent.command_digest not in control_digests
+                ):
+                    with self.store.transaction(self.prefix):
+                        reservation = self.store.one(Reservation, db0.as_tag(local_intent), prefix=self.prefix)
+                        if reservation is not None and reservation.state == ReservationState.HELD:
+                            state.strategy_committed = max(
+                                Decimal(0), state.strategy_committed - reservation.strategy_amount_usd
+                            )
+                            state.owner_committed = max(
+                                Decimal(0), state.owner_committed - reservation.owner_amount_usd
+                            )
+                            reservation.state = ReservationState.RELEASED
+                        local_intent.state = ExecutionState.CANCELED
+                        self.store.append_audit(
+                            self.prefix,
+                            state,
+                            kind="ORPHAN_INTENT_CANCELED",
+                            actor="coordinator",
+                            intent=local_intent,
+                            source="reconcile",
+                        )
+                    recovered += 1
         for control in controls:
-            intent = self.store.one(Intent, control.request_id, prefix=self.prefix)
-            if control.state in {ExecutionState.RESERVED, ExecutionState.UNKNOWN}:
-                outcome = self.broker.lookup_request(self._context, control.request_id)
-                if outcome is None:
-                    unresolved += 1
+            with _runtime_lock:
+                intent = self.store.one(Intent, control.request_id, prefix=self.prefix)
+                if intent is None:
                     continue
-                control.state = getattr(ExecutionState, outcome.state.name)
-                control.outcome = {**asdict(outcome), "state": outcome.state.value}
-                self.store.commit(self.store.control_prefix)
-            elif (
-                control.state == ExecutionState.ACKNOWLEDGED
-                and intent is not None
-                and intent.state == ExecutionState.ACKNOWLEDGED
-                and intent.broker_order_id
-            ):
-                outcome = (
-                    self.broker.lookup_close_order(self._context, str(intent.broker_order_id))
-                    if intent.operation == Operation.close
-                    else self.broker.lookup_order(self._context, str(intent.broker_order_id))
-                )
-                if outcome is None or outcome.state is IntentState.ACKNOWLEDGED:
+                if (
+                    intent.state in {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}
+                    and intent.projected_state == intent.state
+                ):
+                    # A saved initial outcome must not overwrite newer confirmed accounting.
                     continue
-                control.state = getattr(ExecutionState, outcome.state.name)
-                control.outcome = {**asdict(outcome), "state": outcome.state.value}
-                self.store.commit(self.store.control_prefix)
-            elif control.outcome:
-                payload = native_copy(control.outcome)
+                control_state = control.state
+                request_id = str(control.request_id)
+                order_id = intent.broker_order_id
+                operation = intent.operation
+                saved = native_copy(control.outcome)
+            if control_state in {ExecutionState.RESERVED, ExecutionState.UNKNOWN}:
+                outcome = self.broker.lookup_request(self._context, request_id)
+            elif control_state == ExecutionState.ACKNOWLEDGED and order_id:
+                lookup = self.broker.lookup_close_order if operation == Operation.close else self.broker.lookup_order
+                outcome = lookup(self._context, str(order_id))
+            elif saved:
                 outcome = BrokerOutcome(
-                    state=IntentState(str(payload["state"])),
-                    request_id=payload["request_id"],
-                    broker_order_id=payload.get("broker_order_id"),
-                    broker_position_id=payload.get("broker_position_id"),
-                    filled_units=(None if payload.get("filled_units") is None else Decimal(payload["filled_units"])),
-                    actual_cost_usd=(
-                        None if payload.get("actual_cost_usd") is None else money(payload["actual_cost_usd"])
-                    ),
-                    realized_pnl_usd=(
-                        None
-                        if payload.get("realized_pnl_usd") is None
-                        else money(payload["realized_pnl_usd"], allow_negative=True)
-                    ),
-                    raw_fingerprint=payload.get("raw_fingerprint"),
+                    state=IntentState(str(saved["state"])),
+                    request_id=saved["request_id"],
+                    broker_order_id=saved.get("broker_order_id"),
+                    broker_position_id=saved.get("broker_position_id"),
+                    **{
+                        name: None if saved.get(name) is None else Decimal(saved[name])
+                        for name in ("filled_units", "actual_cost_usd", "realized_pnl_usd", "execution_price")
+                    },
+                    raw_fingerprint=saved.get("raw_fingerprint"),
                 )
             else:
+                outcome = None
+            if outcome is None:
+                unresolved += 1
                 continue
-            if intent is not None and intent.state in {
-                ExecutionState.ADMITTED,
-                ExecutionState.UNKNOWN,
-                ExecutionState.ACKNOWLEDGED,
-            }:
+            with _runtime_lock:
+                self.store.open(self.prefix)
+                for entity_type, broker_id in (
+                    ("order", outcome.broker_order_id),
+                    ("position", outcome.broker_position_id),
+                ):
+                    if broker_id is not None:
+                        self.store.claim_ownership(
+                            environment=self._context.environment.value,
+                            trading_account_id=self._context.trading_account_id,
+                            trading_portfolio_id=self._context.trading_portfolio_id,
+                            entity_type=entity_type,
+                            broker_id=broker_id,
+                            storage_key=self.storage_key,
+                        )
+                control.state = getattr(ExecutionState, outcome.state.name)
+                control.outcome = {**asdict(outcome), "state": outcome.state.value}
+                self.store.commit(self.store.control_prefix)
                 reservation = self.store.one(Reservation, db0.as_tag(intent), prefix=self.prefix)
                 if reservation is not None:
                     self._project_outcome(intent, reservation, outcome, native_copy(intent.params), state, binding)
                     recovered += 1
+                if outcome.state in {IntentState.UNKNOWN, IntentState.ACKNOWLEDGED}:
+                    unresolved += 1
         snapshot = self.broker.reconcile(self._context)
         with self.store.transaction(self.prefix):
             self.store.append_audit(
@@ -992,7 +1439,7 @@ class TraderService:
         return {
             "recovered_intents": recovered,
             "unresolved_intents": unresolved,
-            "mirror": "requires_owner_reconciliation",
+            "mirror": "not_applicable" if self.trading_mode == "standalone" else "requires_owner_reconciliation",
         }
 
     def audit_events(self, *, limit: int = 100) -> list[dict[str, Any]]:

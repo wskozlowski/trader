@@ -6,14 +6,16 @@ build-backend = "hatchling.build"
 name = "agentic-trader-api"
 version = "0.2.0"
 description = "Isolated, capability-gated Agent Portfolio trading service"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.14,<3.15"
 dependencies = [
   "cryptography==46.0.3",
-  "dbzero-pro==0.6.4",
+  "dbzero==0.6.6",
+  "fasteners==0.19",
   "httpx==0.28.1",
 ]
 
 [project.optional-dependencies]
+ui = ["nicegui==3.18.0"]
 dev = [
   "mypy==1.18.2",
   "pytest==8.4.2",
@@ -25,6 +27,7 @@ dev = [
 trader = "trader_api.cli:main"
 trader-admin = "trader_api.admin_cli:main"
 trader-worker = "trader_api.ipc:worker_main"
+trader-ui = "trader_api.web_ui.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["trader_api"]
@@ -44,16 +47,16 @@ show_missing = true
 
 [tool.ruff]
 line-length = 120
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.14"
 strict = true
 packages = ["trader_api"]
 exclude = ["tests"]
 
 [tool.uv.sources]
-dbzero-pro = { path = "../dbzero-pro/tmp/py313-current-wheel/dbzero_pro-0.6.4-cp313-cp313-linux_x86_64.whl" }
+dbzero = { path = "/dbzero-data/lib/dbzero-0.6.6-cp314-cp314-linux_x86_64.whl" }

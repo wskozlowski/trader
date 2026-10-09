@@ -9,7 +9,7 @@ import dbzero as db0
 import httpx
 import pytest
 
-from trader_api.broker.observations import PortfolioObservation, normalize_portfolio
+from trader_api.broker.observations import PortfolioObservation, PriceQuote, normalize_portfolio
 from trader_api.broker.transport import HttpTransport
 from trader_api.config import load_profile
 from trader_api.domain import BrokerOutcome, IntentState
@@ -23,7 +23,6 @@ from trader_api.storage import (
     Intent,
     Operation,
     Order,
-    Position,
     Preview,
     RefreshState,
     Reservation,
@@ -104,7 +103,7 @@ def test_native_dashboard_statistics_restart_and_detachment(runtime):
     dashboard = get_dashboard(session)
     assert dashboard.owner_allocation == Decimal("2000")
     assert dashboard.owner_budget.initial_cap == Decimal("2000")
-    assert dashboard.valuation.equity == Decimal("10000")
+    assert dashboard.valuation.equity is None  # Account-wide snapshot is excluded.
     dashboard.operation_counts.clear()
     assert get_dashboard(session).operation_counts["FILLED"] == 1
     close_dbzero()
@@ -112,7 +111,7 @@ def test_native_dashboard_statistics_restart_and_detachment(runtime):
     session2 = open_session(restarted, clock=lambda: clock.now)
     with pytest.raises(TraderError, match="no longer open"):
         get_dashboard(session)
-    assert get_dashboard(session2).valuation.equity == Decimal("10000")
+    assert get_dashboard(session2).valuation.equity is None
     assert get_statistics(session2, Period.ALL).confirmed_costs == Decimal("1.50")
     assert list_positions(session2).items[0].intent == list_operations(session2).items[0].intent
     assert restarted.verify_audit()["valid"] is True
@@ -148,8 +147,9 @@ def test_duplicate_outcomes_partial_close_and_late_confirmations(runtime):
     assert list_positions(session).items[0].strategy_notional_usd == Decimal("50")
     assert get_statistics(session, Period.ALL).confirmed_realized_pnl == Decimal("5")
     # A corrected cumulative amount contributes only its delta, including a confirmed zero cost.
-    outcome = BrokerOutcome(IntentState.FILLED, closed.request_id, "502",
-                            actual_cost_usd=Decimal("0"), realized_pnl_usd=Decimal("6"))
+    outcome = BrokerOutcome(
+        IntentState.FILLED, closed.request_id, "502", actual_cost_usd=Decimal("0"), realized_pnl_usd=Decimal("6")
+    )
     service._project_outcome(closed, close_reservation, outcome, dict(closed.params), state, binding)
     assert get_statistics(session, Period.ALL).confirmed_realized_pnl == Decimal("6")
     assert list_positions(session).items[0].strategy_notional_usd == Decimal("50")
@@ -192,8 +192,9 @@ def test_period_boundaries_and_confirmed_delta_recognition(runtime):
         preview = Preview(Operation.close, {}, clock.now, clock.now, "s", 1, 1)
         intent = Intent(preview, "x", Operation.close, {}, "x", "x", 1, 1, state=ExecutionState.FILLED)
         service.store.tag(intent, "INTENT")
-        record_operation(intent, monday - timedelta(seconds=1),
-                         BrokerOutcome(IntentState.FILLED, "x", realized_pnl_usd=Decimal("5")))
+        record_operation(
+            intent, monday - timedelta(seconds=1), BrokerOutcome(IntentState.FILLED, "x", realized_pnl_usd=Decimal("5"))
+        )
         record_operation(intent, monday, BrokerOutcome(IntentState.FILLED, "x", realized_pnl_usd=Decimal("5")))
     clock.now = monday
     # Identical outcomes cannot move yesterday's P&L into a new period.
@@ -209,8 +210,9 @@ def test_indexed_pages_ties_appends_filters_and_scope(runtime):
     service, session, clock = setup_ui(runtime)
     with service.store.transaction(service.prefix):
         preview = Preview(Operation.open, {}, clock.now, clock.now + timedelta(minutes=5), "s", 1, 1)
-        intents = [Intent(preview, str(i), Operation.open, {}, str(i), str(i), 1, 1, created_at=clock.now)
-                   for i in range(8)]
+        intents = [
+            Intent(preview, str(i), Operation.open, {}, str(i), str(i), 1, 1, created_at=clock.now) for i in range(8)
+        ]
         for intent in intents:
             order = Order(str(intent.sequence), intent, "AAPL", ExecutionState.PENDING)
             service.store.tag(order, "ORDER")
@@ -252,14 +254,16 @@ def test_audit_inherited_indexes_tags_immutability_and_hash(runtime):
     service, session, _clock = setup_ui(runtime)
     state, _ = service._objects()
     with service.store.transaction(service.prefix):
-        event = service.store.append_audit(service.prefix, state, kind="SAME", actor="actor", source="source",
-                                           facts={"value": Decimal("1.25")})
+        event = service.store.append_audit(
+            service.prefix, state, kind="SAME", actor="actor", source="source", facts={"value": Decimal("1.25")}
+        )
         service.store.append_audit(service.prefix, state, kind="other", actor="SAME", source="source")
     assert len(list_audit_events(session, kind="SAME").items) == 1
     assert len(list_audit_events(session, actor="SAME").items) == 1
     assert len(list_audit_events(session, source="SAME").items) == 0
-    page = list_audit_events(session, kind="SAME", start=event.occurred_at,
-                             end=event.occurred_at + timedelta(milliseconds=1))
+    page = list_audit_events(
+        session, kind="SAME", start=event.occurred_at, end=event.occurred_at + timedelta(milliseconds=1)
+    )
     assert page.items[0].event_hash == event.event_hash
     page.items[0].facts["value"] = Decimal("9")
     assert event.facts["value"] == Decimal("1.25")
@@ -322,9 +326,13 @@ def test_broker_normalization_unknowns_and_identity(runtime):
     result = normalize_portfolio({"clientPortfolio": {"credit": "10000"}}, context, clock.now)
     assert result.cash == Decimal("10000") and result.equity is None
     assert "missing_equity" in result.reasons
-    for payload in ({"clientPortfolio": []}, {"clientPortfolio": {"budget": "2000"}},
-                    {"clientPortfolio": {"equity": "nan"}}, {"clientPortfolio": {"equity": True}},
-                    {"accountId": "wrong", "portfolioId": "portfolio-alpha", "equity": "10"}):
+    for payload in (
+        {"clientPortfolio": []},
+        {"clientPortfolio": {"budget": "2000"}},
+        {"clientPortfolio": {"equity": "nan"}},
+        {"clientPortfolio": {"equity": True}},
+        {"accountId": "wrong", "portfolioId": "portfolio-alpha", "equity": "10"},
+    ):
         with pytest.raises(TraderError):
             normalize_portfolio(payload, context, clock.now)
 
@@ -345,9 +353,12 @@ def test_etoro_observation_is_single_read_and_honors_retry_after(runtime):
     assert observation.equity == Decimal("900") and observation.cash == Decimal("100")
     assert observation.unrealized_pnl is None
     assert len(calls) == 1 and calls[0].method == "GET"
-    transport = HttpTransport(profile, httpx.Client(transport=httpx.MockTransport(
-        lambda request: httpx.Response(429, headers={"Retry-After": "420"})
-    )))
+    transport = HttpTransport(
+        profile,
+        httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(429, headers={"Retry-After": "420"}))
+        ),
+    )
     with pytest.raises(TraderError) as error:
         transport.request(profile.routes["ETORO_PNL_URL"])
     assert error.value.details == {"retry_after_seconds": 420}
@@ -355,11 +366,14 @@ def test_etoro_observation_is_single_read_and_honors_retry_after(runtime):
 
 def test_failure_backoff_and_interruption_survive_restart(runtime):
     service, session, clock = setup_ui(runtime)
+    service.initialize("2000")
+    preview = service.preview_open(symbol="AAPL", side="long", strategy_notional_usd="100")
+    service.submit(preview["preview_id"], "refresh-position")
 
-    def failure(context, at):
+    def failure(context, instrument, at):
         raise RuntimeError("secret broker response")
 
-    service.broker.collect_portfolio = failure
+    service.broker.quote = failure
     for delay in (60, 120, 240, 300, 300):
         request_refresh(session)
         assert tick(session)
@@ -384,15 +398,18 @@ def test_failure_backoff_and_interruption_survive_restart(runtime):
 
 def test_fake_clock_refresh_coalescing_backoff_staleness_and_last_good(runtime):
     service, session, clock = setup_ui(runtime)
+    service.initialize("2000")
+    preview = service.preview_open(symbol="AAPL", side="long", strategy_notional_usd="100")
+    service.submit(preview["preview_id"], "refresh-position")
     calls = []
 
-    def reader(context, at):
+    def reader(context, instrument, at):
         calls.append(at)
         for _ in range(4):
             request_refresh(session)
-        return PortfolioObservation(at, Decimal("123"))
+        return PriceQuote(instrument, Decimal("123"), Decimal("124"), at)
 
-    service.broker.collect_portfolio = reader
+    service.broker.quote = reader
     request_refresh(session)
     assert not get_refresh_status(session).running
     assert tick(session)
@@ -403,11 +420,10 @@ def test_fake_clock_refresh_coalescing_backoff_staleness_and_last_good(runtime):
     assert len(calls) == 2
     original = get_dashboard(session).valuation
 
-    def failure(context, at):
-        raise TraderError("BROKER_RATE_LIMITED", "secret payload", retryable=True,
-                          details={"retry_after_seconds": 400})
+    def failure(context, instrument, at):
+        raise TraderError("BROKER_RATE_LIMITED", "secret payload", retryable=True, details={"retry_after_seconds": 400})
 
-    service.broker.collect_portfolio = failure
+    service.broker.quote = failure
     request_refresh(session)
     assert tick(session)
     status = get_refresh_status(session)
@@ -417,7 +433,8 @@ def test_fake_clock_refresh_coalescing_backoff_staleness_and_last_good(runtime):
     clock.now += timedelta(seconds=121)
     assert not tick(session)
     assert get_refresh_status(session).stale
-    assert get_dashboard(session).valuation == original
+    assert get_dashboard(session).valuation.observed_at == original.observed_at
+    assert get_dashboard(session).valuation.unrealized_pnl == original.unrealized_pnl
     clock.now += timedelta(seconds=279)
     assert tick(session)
     stop_refresh(session)
@@ -427,16 +444,19 @@ def test_fake_clock_refresh_coalescing_backoff_staleness_and_last_good(runtime):
 
 def test_real_thread_start_stop_no_overlap_and_scope_revocation(runtime):
     service, session, clock = setup_ui(runtime)
+    service.initialize("2000")
+    preview = service.preview_open(symbol="AAPL", side="long", strategy_notional_usd="100")
+    service.submit(preview["preview_id"], "refresh-position")
     entered, release = threading.Event(), threading.Event()
     calls = []
 
-    def reader(context, at):
+    def reader(context, instrument, at):
         calls.append(at)
         entered.set()
         assert release.wait(5)
-        return PortfolioObservation(at, Decimal("100"))
+        return PriceQuote(instrument, Decimal("100"), Decimal("101"), at)
 
-    service.broker.collect_portfolio = reader
+    service.broker.quote = reader
     start_refresh(session)
     start_refresh(session)
     assert entered.wait(5)
@@ -457,7 +477,7 @@ def test_real_thread_start_stop_no_overlap_and_scope_revocation(runtime):
     stop_refresh(session)
 
 
-def test_bounded_large_history_and_no_history_on_summary_reads(runtime, monkeypatch):
+def test_bounded_large_history_and_no_account_snapshots_on_dashboard_reads(runtime, monkeypatch):
     service, session, clock = setup_ui(runtime)
     with service.store.transaction(service.prefix):
         preview = Preview(Operation.open, {}, clock.now, clock.now, "s", 1, 1)
@@ -485,7 +505,7 @@ def test_bounded_large_history_and_no_history_on_summary_reads(runtime, monkeypa
     original_find = db0.find
 
     def guarded_find(model, *args, **kwargs):
-        assert model not in (Intent, Position, Order, AuditEvent, AccountingObservation, ValuationSnapshot, ChartBucket)
+        assert model not in (Order, AuditEvent, AccountingObservation, ValuationSnapshot, ChartBucket)
         return original_find(model, *args, **kwargs)
 
     monkeypatch.setattr(db0, "find", guarded_find)
@@ -527,7 +547,7 @@ def test_errors_and_unavailable_collection(runtime):
     with pytest.raises(TraderError):
         get_portfolio_chart(session, clock.now, clock.now)
     assert tick(session)
-    assert get_refresh_status(session).error == "VALUATION_UNAVAILABLE"
+    assert get_refresh_status(session).error is None  # Empty portfolio needs no broker quote.
     assert get_dashboard(session).valuation.equity is None
     stop_refresh(session)
     close_dbzero()
